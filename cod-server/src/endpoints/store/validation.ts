@@ -1,0 +1,290 @@
+import { z } from "zod";
+import { toLocalAlgerianMobile } from "../../../../cod-shared/lib/phone";
+import { LAST_WILAYA_ID } from "../../../../cod-shared/places";
+import { metaBrowserId, metaClickId } from "../../../../cod-shared/attribution/meta-ids";
+import { parseCapturedTouches } from "../../../../cod-shared/attribution/touch";
+
+/** Meta's `_fbc` / `_fbp` as sent by a storefront: kept when well formed, otherwise absent. */
+export const metaClickIdField = z.preprocess((v) => metaClickId(v) ?? undefined, z.string().optional());
+export const metaBrowserIdField = z.preprocess((v) => metaBrowserId(v) ?? undefined, z.string().optional());
+
+const touchSchema = z.object({
+  at: z.string(),
+  params: z.record(z.string(), z.string()),
+  path: z.string().nullable(),
+  ref: z.string().nullable(),
+});
+
+/**
+ * The visit's first touch, last ad touch, last source (the latest arrival that
+ * was neither direct nor an ad) and latest arrival, as the storefront captured
+ * them (`cod-shared/attribution`). Read from a cookie the shopper holds: what
+ * is unreadable is dropped, never the reason an order is refused.
+ */
+export const capturedTouchesField = z.preprocess(
+  (v) => parseCapturedTouches(v, new Date()) ?? undefined,
+  z.object({ first: touchSchema.nullable(), last: touchSchema.nullable(), source: touchSchema.nullable().optional(), visit: touchSchema.nullable() }).optional(),
+);
+
+export const variantSelectionSchema = z.object({
+  variantId: z.string().min(1),
+  variantLabel: z.string().optional(),
+});
+
+/**
+ * One line of a cart request.
+ *
+ * `pricePerUnit` is accepted for storefront UI continuity and is display-only:
+ * the server resolves every price from the catalog row. Bounds here mirror
+ * MAX_LINE_QUANTITY in cod-shared/queries/cart.ts, which re-checks them after
+ * duplicate lines are merged — two lines of 60 for one variant are 120 units.
+ */
+export const cartItemSchema = z.object({
+  productId: z.string().min(1).max(200),
+  productName: z.string().min(1).max(200),
+  variantId: z.preprocess(
+    (v) => (v === "" || v == null ? undefined : v),
+    z.string().min(1).max(200).optional(),
+  ),
+  variantLabel: z.preprocess(
+    (v) => (v === "" || v == null ? undefined : v),
+    z.string().max(100).optional(),
+  ),
+  quantity: z.number().int().min(1).max(100),
+  pricePerUnit: z.number().nonnegative().optional(),
+  offerId: z.preprocess(
+    (v) => (v === "" || v == null ? undefined : v),
+    z.string().optional(),
+  ),
+});
+
+/**
+ * What an order is FOR: a basket (`items[]`), or one product — a quantity, or a
+ * variant chosen per unit — with an optional offer tier. The order and its
+ * quote take these same fields, and normalizeOrderLines turns either into lines,
+ * so the two can never read a request differently.
+ */
+const orderLineFields = {
+  // These describe the ONE product a direct order form was rendered for. A
+  // basket has no single representative product, and normalizeOrderLines
+  // ignores them entirely once `items[]` is present, so they are optional here
+  // and required by the refinements whenever there is no basket.
+  productId: z.string().min(1).max(200).optional(),
+  productName: z.string().min(1).max(200).optional(),
+  variantId: z.string().min(1).optional(),
+  variantLabel: z.string().max(100).optional(),
+  quantity: z.number().int().min(1).max(100).default(1),
+  // Explicit offer selection from client — server applies this exact offer rather than auto-detecting
+  offerId: z.preprocess(
+    (v) => (v === "" || v == null ? undefined : v),
+    z.string().optional()
+  ),
+  // Per-unit variant selections (JSON string parsed from hidden form input).
+  // When present, overrides variantId/variantLabel for multi-unit orders.
+  // Shape after parse: [{variantId, variantLabel?}] — one entry per ordered unit,
+  // so never more entries than a line may hold units.
+  variantSelections: z.preprocess(
+    (v) => {
+      if (!v) return undefined;
+      // Already a parsed array (JSON API path — Astro action sends array via JSON.stringify)
+      if (Array.isArray(v)) return v.length === 0 ? undefined : v;
+      // String form-submission path (direct HTML form POST)
+      if (typeof v !== "string" || v === "[]") return undefined;
+      try { return JSON.parse(v); } catch { return undefined; }
+    },
+    z.array(variantSelectionSchema).max(100).optional()
+  ),
+  // Cart request. When present it supersedes the flat product fields above,
+  // which stay required so every existing storefront keeps working unchanged.
+  // The 20-line cap bounds the commit batch and the carrier payload; it is
+  // re-checked after duplicate lines are merged (cod-shared/queries/cart.ts).
+  items: z.preprocess(
+    (v) => {
+      if (!v) return undefined;
+      if (Array.isArray(v)) return v.length === 0 ? undefined : v;
+      // Form submissions send it as a JSON string, like variantSelections.
+      if (typeof v !== "string" || v === "[]") return undefined;
+      try {
+        const parsed = JSON.parse(v);
+        return Array.isArray(parsed) && parsed.length > 0 ? parsed : undefined;
+      } catch {
+        return undefined;
+      }
+    },
+    z.array(cartItemSchema).min(1).max(20).optional(),
+  ),
+};
+
+/**
+ * The code the shopper typed, as typed: matched without regard to case or
+ * spaces (`normalizeCouponCode`). An empty box sends none.
+ */
+const couponCodeField = z.preprocess(
+  (v) => (typeof v === "string" && v.trim() === "") || v == null ? undefined : v,
+  z.string().max(64).optional()
+);
+
+export const storeOrderSchema = z.object({
+  ...orderLineFields,
+  customerName: z.string().min(2).max(100),
+  // Algerian mobile only, normalized to the canonical local form "05XXXXXXXX".
+  // Accepts 05…, +2135…, 2135…, 002135… with separators; rejects landlines,
+  // foreign numbers, and short/long garbage. Canonical form keeps customer
+  // deduplication stable regardless of how the shopper typed the number.
+  phone: z.preprocess(
+    (v) => (typeof v === "string" ? toLocalAlgerianMobile(v) ?? v : v),
+    z.string().regex(
+      /^0[567]\d{8}$/,
+      "رقم الهاتف غير صحيح — أدخل رقماً جزائرياً يبدأ بـ 05 أو 06 أو 07"
+    )
+  ),
+  wilayaId: z.number().int().min(1).max(LAST_WILAYA_ID),
+  communeId: z.string().min(1),
+  address: z.string().max(300).optional(),
+  deliveryType: z.enum(["home", "stop_desk"]).default("home"),
+  // Display-only: accepted for storefront UI continuity but NEVER trusted for
+  // pricing — the server resolves the unit price from the catalog row.
+  pricePerUnit: z.number().nonnegative().optional(),
+  notes: z.string().max(500).optional(),
+  // Transport only. Whether the field is asked for at all, and whether it may
+  // be empty, is the merchant's Checkout Form Policy — applied in the handler
+  // by applyCheckoutPolicy, because this schema is validated by the route
+  // BEFORE the handler runs and a policy-built schema would never see a key
+  // this one had already stripped.
+  email: z.preprocess(
+    (v) => (v === "" || v == null ? undefined : v),
+    z.string().max(254).optional()
+  ),
+  // Answers to the merchant's custom fields, as ONE JSON field — the same
+  // shape as variantSelections/items above, and for the same reason: the
+  // storefront's core action validates form input against a fixed whitelist
+  // and strips everything else, so N flat inputs would each need whitelisting
+  // while one field survives any policy. Validated per field definition in the
+  // handler; unknown ids never reach the order.
+  customFieldResponses: z.preprocess(
+    (v) => {
+      if (!v) return undefined;
+      if (Array.isArray(v)) return v.length === 0 ? undefined : v;
+      if (typeof v !== "string" || v === "[]") return undefined;
+      // Kept as the raw string: applyCheckoutPolicy owns parsing, so the size
+      // cap and the malformed-payload behaviour live in exactly one place.
+      return v.length > 4000 ? undefined : v;
+    },
+    z.union([z.string(), z.array(z.unknown())]).optional()
+  ),
+  // Meta Pixel tracking cookies captured by the storefront at placement time.
+  // A malformed value is dropped, never the reason an order is refused.
+  fbc: metaClickIdField,
+  fbp: metaBrowserIdField,
+  attribution: capturedTouchesField,
+  // WhatsApp OTP verification proof (HMAC token from /store/otp/verify, or a
+  // bypass token when dzverify could not serve the send). Required only when
+  // the store's OTP verification is enabled.
+  otpToken: z.preprocess(
+    (v) => (v === "" || v == null ? undefined : v),
+    z.string().min(10).max(1024).optional()
+  ),
+  // Cloudflare Turnstile widget proof. Required only when the store has
+  // Turnstile enabled; verified server-side against the siteverify API
+  // (tokens are single-use, max 2048 chars, expire after 300 seconds).
+  turnstileToken: z.preprocess(
+    (v) => (v === "" || v == null ? undefined : v),
+    z.string().min(1).max(2048).optional()
+  ),
+  // Landing page attribution — best-effort. An unknown/draft/archived slug
+  // leaves the order unattributed and the order still succeeds (revenue
+  // first, attribution second).
+  landingPageSlug: z.preprocess(
+    (v) => (v === "" || v == null ? undefined : v),
+    z.string().min(1).max(60).optional()
+  ),
+  couponCode: couponCodeField,
+  // The checkout attempt's key, stamped by the shopper's browser on its first
+  // submit: a double click, a resubmitted form or a retried request carries the
+  // same key and gets back the order already placed (migration 0062).
+  checkoutKey: z.preprocess(
+    (v) => (v === "" || v == null ? undefined : v),
+    z.string().uuid().optional()
+  ),
+  checkoutContext: z.preprocess(
+    (v) => (typeof v === "string" && v.length > 0 && v.length <= 512 ? v : undefined),
+    z.string().optional()
+  ),
+})
+  /**
+   * An order is either a basket or a single product — never neither.
+   *
+   * Without `items[]` the flat product fields are the only thing describing
+   * what was ordered, so all three are required and the request is rejected at
+   * the seam rather than reaching an engine that would throw EMPTY_CART.
+   */
+  .superRefine((data, ctx) => {
+    if (data.items && data.items.length > 0) return;
+    for (const field of ["productId", "productName", "pricePerUnit"] as const) {
+      if (data[field] === undefined) {
+        ctx.addIssue({
+          code: "custom",
+          path: [field],
+          message: `${field} is required when the request carries no items[]`,
+        });
+      }
+    }
+  });
+
+export type StoreOrderInput = z.infer<typeof storeOrderSchema>;
+
+/**
+ * Storefront review submission.
+ *
+ * `orderNumber` is the customer-visible identifier (ORD-YYYYMMDD-NNNN),
+ * NOT the internal orders.id UUID. The storefront only ever shows the
+ * order number to customers on the thank-you page, so that is the ONLY
+ * identifier they can type back into the review form.
+ *
+ * The handler resolves orderNumber → orders.id internally before writing
+ * the review FK. Keeping the wire field named `orderNumber` prevents the
+ * "form says Order Number but server expects UUID" confusion we had in
+ * v1.0.54 and earlier.
+ */
+
+/**
+ * Cart validation request — the quote of an order.
+ *
+ * What is being ordered, in the order's own fields (a basket, or one product
+ * with its quantity, per-unit variants and offer tier), so a product page asks
+ * with exactly what its form will post. `destination` is where it would be
+ * delivered, so the answer can carry the delivery fee and total the order
+ * would charge there. `couponCode` is judged like the order's; `phone`, once
+ * the shopper has typed one, lets a coupon for selected customers, or one use
+ * per customer, be judged before the order is placed.
+ */
+export const validateCartSchema = z
+  .object({
+    ...orderLineFields,
+    pricePerUnit: z.number().nonnegative().optional(),
+    destination: z
+      .object({
+        wilayaId: z.number().int().min(1).max(LAST_WILAYA_ID),
+        communeId: z.string().min(1).max(200).optional(),
+        deliveryType: z.enum(["home", "stop_desk"]).default("home"),
+      })
+      .optional(),
+    couponCode: couponCodeField,
+    phone: z.string().max(32).optional(),
+  })
+  // A basket, or a product — the same rule as the order, minus the display
+  // price the quote never needed.
+  .superRefine((data, ctx) => {
+    if (data.items && data.items.length > 0) return;
+    for (const field of ["productId", "productName"] as const) {
+      if (data[field] === undefined) {
+        ctx.addIssue({
+          code: "custom",
+          path: [field],
+          message: `${field} is required when the request carries no items[]`,
+        });
+      }
+    }
+  });
+
+export type ValidateCartInput = z.infer<typeof validateCartSchema>;

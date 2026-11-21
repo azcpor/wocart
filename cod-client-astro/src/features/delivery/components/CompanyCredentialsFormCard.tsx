@@ -1,0 +1,160 @@
+import { CheckCircle2, Circle, ExternalLink, Globe, Key, ShieldCheck } from "lucide-react";
+import { Field, Input } from "@/components/ui";
+import { useT } from "@/i18n/react";
+import { isCompanyConnected } from "@/features/delivery/model";
+import { cn } from "@/lib/utils";
+import type { DeliveryCompany, ProviderConfig } from "@/features/delivery/types";
+
+export function CompanyCredentialsFormCard({
+  config,
+  company,
+  apiToken,
+  onApiTokenChange,
+  apiUserGuid,
+  onApiUserGuidChange,
+  fromWilayaName,
+  onFromWilayaNameChange,
+  apiEndpoint,
+  onApiEndpointChange,
+  busy,
+}: {
+  config: ProviderConfig;
+  company: DeliveryCompany | null;
+  apiToken: string;
+  onApiTokenChange: (val: string) => void;
+  apiUserGuid: string;
+  onApiUserGuidChange: (val: string) => void;
+  fromWilayaName: string;
+  onFromWilayaNameChange: (val: string) => void;
+  apiEndpoint: string;
+  onApiEndpointChange: (val: string) => void;
+  busy: boolean;
+}) {
+  const t = useT("delivery_companies");
+  const isConnected = isCompanyConnected(company);
+
+  return (
+    <div className="space-y-4 rounded-xl bg-card p-5 lg:col-span-2 shadow-card">
+      <div className="flex items-start gap-3 border-b border-border pb-4">
+        <span
+          className={cn(
+            "grid size-10 shrink-0 place-items-center rounded-xl",
+            isConnected ? "bg-[var(--tone-success-bg)] text-[var(--tone-success-text)]" : "bg-primary/10 text-primary",
+          )}
+        >
+          {isConnected ? <ShieldCheck size={18} /> : <Key size={18} />}
+        </span>
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <h1 className="text-lg font-semibold text-foreground">
+              {isConnected ? t("credentials_title_configure") : t("credentials_title_connect")}
+            </h1>
+            <span
+              className={cn(
+                "inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-[11px] font-semibold",
+                isConnected
+                  ? "border-[var(--tone-success-border)] bg-[var(--tone-success-bg)] text-[var(--tone-success-text)]"
+                  : "border-border bg-muted text-muted-foreground",
+              )}
+            >
+              {isConnected ? <CheckCircle2 size={9} /> : <Circle size={9} />}
+              {isConnected ? t("connected") : t("not_connected")}
+            </span>
+          </div>
+          <a
+            href={config.website}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="mt-1 inline-flex items-center gap-1.5 text-xs font-semibold text-muted-foreground/60 transition-colors hover:text-foreground"
+          >
+            <Globe size={11} aria-hidden="true" />
+            {new URL(config.website).hostname}
+            <ExternalLink size={9} aria-hidden="true" />
+          </a>
+        </div>
+      </div>
+
+      <h2 className="text-sm font-semibold text-card-foreground">
+        {t("api_credentials")}
+      </h2>
+
+      <Field label={config.tokenLabel ?? (config.requiresEndpoint ? t("ecotrack_token") : t("api_token"))}>
+        <Input
+          value={apiToken}
+          onChange={(event) => onApiTokenChange(event.currentTarget.value)}
+          type="password"
+          placeholder={isConnected ? "••••••••••••••••" : (config.tokenLabel ?? t("api_token"))}
+          dir="ltr"
+          disabled={busy}
+          autoComplete="off"
+          className="font-mono"
+        />
+        {(config.provider === "ecotrack" || config.provider === "zr_express" || config.provider === "noest") && (
+          <p className="mt-1 text-xs font-medium text-muted-foreground/60">{t("token_checked_hint")}</p>
+        )}
+        {config.tokenHint && (
+          <p className="mt-1 text-xs font-medium text-muted-foreground/60">
+            {config.tokenHint}
+          </p>
+        )}
+      </Field>
+
+      {config.requiresUserGuid && (
+        <Field label={config.guidLabel ?? (config.provider === "zr_express" ? t("tenant_id") : t("user_guid"))}>
+          <Input
+            value={apiUserGuid}
+            onChange={(event) => onApiUserGuidChange(event.currentTarget.value)}
+            placeholder={config.guidLabel ?? t("user_id_placeholder")}
+            dir="ltr"
+            disabled={busy}
+            autoComplete="off"
+            className="font-mono"
+          />
+          {config.guidHint && (
+            <p className="mt-1 text-xs font-medium text-muted-foreground/60">
+              {config.guidHint}
+            </p>
+          )}
+        </Field>
+      )}
+
+      {config.requiresFromWilaya && (
+        <Field label={t("from_wilaya")}>
+          <Input
+            value={fromWilayaName}
+            onChange={(event) => onFromWilayaNameChange(event.currentTarget.value)}
+            placeholder="Alger"
+            dir="ltr"
+            disabled={busy}
+            autoComplete="off"
+          />
+          <p className="mt-1 text-xs font-medium text-muted-foreground/60">
+            {t("from_wilaya_hint")}
+          </p>
+        </Field>
+      )}
+
+      {config.requiresEndpoint && (
+        <Field label={config.endpointLabel ?? t("ecotrack_endpoint")}>
+          <Input
+            value={apiEndpoint}
+            onChange={(event) => onApiEndpointChange(event.currentTarget.value)}
+            placeholder={config.endpointDefault ?? "https://"}
+            dir="ltr"
+            disabled={busy}
+            autoComplete="off"
+            className="font-mono"
+          />
+          {config.provider === "ecotrack" && (
+            <p className="mt-1 text-xs font-medium text-muted-foreground/60">{t("endpoint_free_hint")}</p>
+          )}
+          {config.endpointHint && (
+            <p className="mt-1 text-xs font-medium text-muted-foreground/60">
+              {config.endpointHint}
+            </p>
+          )}
+        </Field>
+      )}
+    </div>
+  );
+}

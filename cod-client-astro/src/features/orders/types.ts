@@ -1,0 +1,410 @@
+import type { OrderAttributionView, OrderSourceSummary } from "../../../../cod-shared/attribution/view";
+import type { RuleMatch } from "../../../../cod-shared/order-screening/rules";
+import type { OrderStatus } from "../../../../cod-shared/orders/lifecycle";
+import type { OrderStage } from "../../../../cod-shared/orders/stage";
+import type { HandoffState, ShipmentEventSource, ShipmentKind } from "../../../../cod-shared/shipments/model";
+import type { ShipmentAction } from "../../../../cod-shared/shipments/actions";
+import type { InterpretationKind, Milestone } from "../../../../cod-shared/shipments/interpretation";
+
+export type { OrderStatus, OrderStage, ShipmentAction, ShipmentKind, HandoffState, Milestone };
+export type DeliveryType = "home" | "stop_desk";
+export type OrderType = "online" | "offline";
+
+export interface StatusHistoryItem {
+  id: string;
+  orderId?: string;
+  status: OrderStatus;
+  timestamp: string;
+  by: string | null;
+  byName: string | null;
+}
+
+export interface OrderProduct {
+  id: string;
+  orderId: string;
+  /** Null once the product was removed: the line keeps what was sold. */
+  productId: string | null;
+  productName: string;
+  variantId: string | null;
+  variantLabel: string | null;
+  sku?: string | null;
+  quantity: number;
+  pricePerUnit: number;
+  lineTotal: number;
+  status: "fulfilled" | "partially_returned" | "returned";
+  returnedQuantity: number;
+  createdAt: string;
+  /** The offer applied to the line — the one its product earned — or the offer that gave it. */
+  offerId: string | null;
+  /** The offer's name when the order was placed — kept when it is renamed or deleted. */
+  offerName: string | null;
+  /** A reward, given by `offerId` at no charge. */
+  reward: boolean;
+  /** The line's share of the order's coupon discount; `lineTotal` is already net of it. */
+  discount: number;
+}
+
+export interface OrderBase {
+  id: string;
+  orderNumber: string;
+  customerId: string;
+  customerName: string;
+  phone: string;
+  wilayaId: number | null;
+  wilaya: string | null;
+  communeId: string | null;
+  commune: string | null;
+  city: string | null;
+  address: string | null;
+  price: number;
+  deliveryFee: number;
+  codAmount: number | null;
+  /** The order's processing; its delivery is its shipment's — see `stage`. */
+  status: OrderStatus;
+  orderType: OrderType;
+  /** What the customer asked for; the shipment may travel otherwise. */
+  deliveryType: DeliveryType;
+  stationCode: string | null;
+  driverName: string | null;
+  notes: string | null;
+  landingPageId: string | null;
+  /**
+   * Captured at order time when the merchant enabled the email field. A
+   * snapshot, like customerName — never re-read from the customer record.
+   */
+  customerEmail?: string | null;
+  /** Answers to the merchant's custom questions, as stored with the order. */
+  customFieldsJson?: string | null;
+  /** When the finished order was archived: out of the working lists, still counted in sales. */
+  archivedAt: string | null;
+  /** Where the order stands overall: its processing, then its delivery. */
+  stage: OrderStage;
+  /** The delivery needs the merchant: an unconfirmed handoff, a parcel cancelled or flagged by the carrier. */
+  needsAttention: boolean;
+  createdAt: string;
+  updatedAt: string;
+  /** The confirmation team member the order is with now; null while with nobody. */
+  assigneeId?: string | null;
+  assigneeName?: string | null;
+  assignedAt?: string | null;
+  /** Times it moved on from a member who did not act in time; at the store's limit it waits for a manager. */
+  takeBacks?: number;
+  /** When the customer asked to be called back. */
+  callbackAt?: string | null;
+  confirmedAt?: string | null;
+  confirmedBy?: string | null;
+  /** Calls without an answer: an order on no answer is at Call 1, Call 2, Call 3… */
+  unansweredCalls: number;
+}
+
+export interface OrderListItem extends OrderBase {
+  hasReview?: number;
+  flagged?: number;
+  /** The Active Flag rules that flagged it. */
+  flagReasons?: RuleMatch[];
+  shipmentId: string | null;
+  shipmentKind: ShipmentKind | null;
+  carrierName: string | null;
+  trackingNumber: string | null;
+  /** Where the order came from, in short; null when it is not known. */
+  source?: OrderSourceSummary | null;
+}
+
+export interface ShipmentEvent {
+  id: string;
+  source: ShipmentEventSource;
+  vocabulary: string | null;
+  providerStatus: string | null;
+  providerStatusLabel: string | null;
+  interpretation: InterpretationKind | null;
+  milestone: Milestone | null;
+  attention: boolean;
+  anomaly: string | null;
+  reason: string | null;
+  occurredAt: string;
+  recordedAt: string;
+  actorId: string | null;
+}
+
+/** An order's delivery: a carrier company's parcel, or the store's own driver. */
+export interface Shipment {
+  id: string;
+  orderId: string;
+  kind: ShipmentKind;
+  companyId: string | null;
+  carrierName: string | null;
+  driverId: string | null;
+  handoffState: HandoffState;
+  carrierParcelId: string | null;
+  trackingNumber: string | null;
+  deliveryType: DeliveryType;
+  stationCode: string | null;
+  codAmount: number;
+  driverFee: number;
+  /** What the delivery company charges the store for this parcel, frozen at hand-off; null when it gives no price there. */
+  shippingCost: number | null;
+  /** What it charges if the parcel comes back, frozen with the cost. */
+  returnFee: number | null;
+  weight: number | null;
+  isFragile: boolean | null;
+  providerStatus: string | null;
+  providerStatusLabel: string | null;
+  providerStatusKind: InterpretationKind | null;
+  providerStatusAt: string | null;
+  validatedAt: string | null;
+  outForDeliveryAt: string | null;
+  deliveredAt: string | null;
+  returnStartedAt: string | null;
+  returnedAt: string | null;
+  cancelledAt: string | null;
+  deliveryAttempts: number;
+  attentionSince: string | null;
+  lastSyncedAt: string | null;
+  createdBy: string | null;
+  createdAt: string;
+  updatedAt: string;
+  /** What can be done to it now — the server's rules. */
+  actions: ShipmentAction[];
+  events?: ShipmentEvent[];
+}
+
+export interface OrderDetail extends OrderBase {
+  /** Where the order came from (ADR 0026); null when nothing is known. */
+  attribution?: OrderAttributionView | null;
+  /** The code the order was placed with; null without one. */
+  couponCode: string | null;
+  /** What the coupon took off, carried by the lines; `price` is already net of it. */
+  couponDiscount: number;
+  /** The offer that made delivery free; null when none did, or once that offer is deleted. */
+  deliveryOfferId: string | null;
+  /** That offer's name when the order was placed — kept when it is renamed or deleted. */
+  deliveryOfferName: string | null;
+  products: OrderProduct[];
+  statusHistory: StatusHistoryItem[];
+  shipment: Shipment | null;
+  decidedAt?: string | null;
+  decidedByName?: string | null;
+  confirmedByName?: string | null;
+  /** Who the order was given to, newest first. */
+  assignmentHistory?: AssignmentStep[];
+}
+
+/** One handover of an order to a team member, or back to nobody. */
+export interface AssignmentStep {
+  id: string;
+  at: string;
+  to: { id: string; name: string } | null;
+  from: { id: string; name: string } | null;
+  /** By the store's rule, by a manager, or taken back from a member who did not act in time. */
+  way: "automatic" | "manual" | "take_back";
+  byName: string | null;
+}
+
+/** A note between the merchant and the carrier's courier. */
+export interface ShipmentRemark {
+  content: string;
+  createdAt: string | null;
+}
+
+export interface OrderPage {
+  orders: OrderListItem[];
+  nextCursor: string | null;
+}
+
+export interface OrderStageCounts {
+  stages: Array<{ stage: OrderStage; count: number }>;
+  needsAttention: number;
+  archived: number;
+  /** Orders still waiting whose customer asked to be called back. */
+  callbacks: number;
+  /** Of those, the ones whose callback time has come. */
+  callbacksDue: number;
+  /** Orders on no answer by their call: Call 1, Call 2, and Call 3 with every later call. */
+  noAnswer: { call1: number; call2: number; call3OrMore: number };
+  /** Of the parcels whose delivery ended, the share delivered, a whole percent; null before any ended. */
+  deliveryRate: number | null;
+}
+
+/** What can be done to clear an order away, as the server decides it. */
+export interface OrderRemoval {
+  id: string;
+  orderNumber: string;
+  shipment: "none" | "open" | "closed";
+  /** Only an order never handed to delivery. */
+  deletable: boolean;
+  /** A finished order — cancelled, or its delivery ended — not archived yet. */
+  archivable: boolean;
+  archivedAt: string | null;
+  lines: number;
+  restockUnits: number;
+  reviews: number;
+}
+
+/** How one order of a handoff ended. */
+export type HandoffItem =
+  | { orderId: string; orderNumber: string; outcome: "accepted"; shipment: Shipment; validationError?: string }
+  | { orderId: string; orderNumber: string; outcome: "unknown"; shipment: Shipment; message: string }
+  | { orderId: string; orderNumber: string | null; outcome: "refused"; error: { code: string; message: string } };
+
+export interface BulkHandoff {
+  results: HandoffItem[];
+  summary: { accepted: number; unknown: number; refused: number };
+}
+
+export interface Driver {
+  id: string;
+  firstName: string;
+  lastName: string;
+  phone: string;
+  phone2: string | null;
+  vehicleType: "motorcycle" | "car" | "van" | null;
+  status: "available" | "busy" | "inactive";
+}
+
+export interface CarrierCapabilities {
+  homeDelivery: boolean;
+  stopDesk: boolean;
+  separateValidation: boolean;
+  bulkCreate: number;
+  parcelFields: { weight: boolean; fragile: boolean; remarks: boolean };
+  limits: { maxAmount: number | null; maxDescription: number | null };
+  update: boolean;
+  cancel: boolean;
+  remarks: { add: boolean; list: boolean };
+  history: boolean;
+  historyBatch: number;
+  findByReference: boolean;
+  updates: "webhook" | "pull";
+  label: boolean;
+  askReturn: boolean;
+  requestNewAttempt: boolean;
+  confirmReturn: boolean;
+  stopDeskList: boolean;
+  verifyConnection: boolean;
+}
+
+export interface DeliveryCompany {
+  id: string;
+  name: string;
+  nameAr: string;
+  code: string;
+  active: boolean;
+  isConnected: boolean;
+  provider: string | null;
+  supportsHomeDelivery: boolean;
+  supportsStopDesk: boolean;
+  autoValidate: boolean | null;
+  capabilities: CarrierCapabilities | null;
+}
+
+export interface StopDesk {
+  id: string;
+  companyId: string;
+  code: string;
+  name: string;
+  commune: string | null;
+  wilayaId: number | null;
+  address: string | null;
+  active: boolean;
+}
+
+export interface Customer {
+  id: string;
+  name: string;
+  phone: string;
+  phone2: string | null;
+  wilayaId: number | null;
+  communeId: string | null;
+  wilaya: string;
+  commune: string | null;
+  address: string | null;
+}
+
+export interface ProductVariant {
+  id: string;
+  productId: string;
+  variations: Record<string, string>;
+  price: number;
+  sku: string;
+  inventory: number;
+  active: boolean;
+}
+
+export interface Product {
+  id: string;
+  name: string;
+  price: number;
+  hasVariants: boolean;
+  variants: ProductVariant[];
+  inventory: number;
+  totalInventory: number;
+  trackInventory: boolean;
+  shippingProfileId: string | null;
+}
+
+export interface ShippingRule {
+  id: string;
+  profileId: string;
+  wilayaId: number;
+  wilayaName: string;
+  wilayaNameAr: string;
+  homePrice: number;
+  stopDeskPrice: number;
+  homeEnabled: boolean;
+  stopDeskEnabled: boolean;
+}
+
+export type { Commune, Wilaya } from "@/features/geography/types";
+
+export const ABANDONED_STATUSES = [
+  "pending",
+  "abandoned",
+  "contacted",
+  "converted",
+] as const;
+
+export type AbandonedOrderStatus = (typeof ABANDONED_STATUSES)[number];
+
+/** One line of an abandoned basket, as the storefront captured it. */
+export interface AbandonedOrderItem {
+  productId: string;
+  productName: string;
+  variantId?: string | null;
+  variantLabel?: string | null;
+  quantity: number;
+  unitPrice: number;
+}
+
+export interface AbandonedOrder {
+  id: string;
+  sessionId: string;
+  customerName: string;
+  phone: string;
+  wilayaId: number | null;
+  communeId: string | null;
+  wilayaName: string | null;
+  communeName: string | null;
+  /** The only product, or the first line of the basket. Always set when known. */
+  productId: string | null;
+  productName: string | null;
+  variantId: string | null;
+  variantLabel: string | null;
+  /** Cart value at abandonment: the basket subtotal, or one unit's price. */
+  price: number | null;
+  /** The whole basket. Null for a single-product checkout. */
+  items: AbandonedOrderItem[] | null;
+  /** Distinct lines in the basket. Null for a single-product checkout. */
+  itemCount: number | null;
+  deliveryType: DeliveryType | null;
+  status: AbandonedOrderStatus;
+  convertedOrderId: string | null;
+  convertedOrderNumber: string | null;
+  recoveryAttempts: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AbandonedStats {
+  totalAbandoned: number;
+  totalConverted: number;
+}

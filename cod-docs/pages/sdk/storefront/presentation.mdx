@@ -1,0 +1,314 @@
+---
+description: Format prices, serve resized images from any media host, link to the store's WhatsApp, and send the Meta browser events.
+---
+
+# Money, images, WhatsApp and Meta events
+
+These helpers are for presentation. They do not change what a shopper is
+charged, which image the merchant chose, or which conversion the server
+records.
+
+## Money
+
+`formatMoney(amount, { symbol, locale, decimals })` is the one formatter:
+
+```ts
+import { formatMoney } from "@wocart/storefront";
+
+formatMoney(product.price, {
+  symbol: config.currencySymbol,
+  locale: config.locale,
+});
+```
+
+It formats the number for the locale, then writes the symbol **after** the
+amount in every language, as Algerian prices are written, joined by a no-break
+space so the two never wrap apart:
+
+| `locale` | `symbol` | Result |
+| --- | --- | --- |
+| `ar` | `دج` | `5,000 دج` |
+| `ar-DZ` | `دج` | `5.000 دج` |
+| `fr` | `DA` | `5 000 DA` (the group separator is a narrow no-break space) |
+| `en` | `DA` | `5,000 DA` |
+
+Digits and separators are the runtime's `Intl` data for that locale. Without a
+symbol the result is the amount alone.
+
+The default is zero decimals: Algerian dinar prices are whole amounts. Pass
+`decimals: 2` only when the store actually uses fractional amounts.
+
+Always pass `config.locale` and `config.currencySymbol`, not a hardcoded
+`"DZD"` and not the primary language. `currencySymbol` is already in the
+page's language (`دج` in Arabic, `DA` in French).
+
+`amount` is in the store's whole currency unit. Do not divide by 100.
+
+## Images
+
+Every image the server answers is a `MediaImage`, `{ key, url, width, height }`
+(`width` and `height` are `null` when unknown). `config.media` is the store's
+`MediaDelivery`, `{ kind, origin }`: where every key is served from and how
+that origin resizes. The helpers take it, so one theme works on every host a
+store can use.
+
+| `config.media.kind` | Resizing |
+| --- | --- |
+| `imagekit` | ImageKit's `?tr=` transformations |
+| `cloudflare` | Cloudflare's `/cdn-cgi/image/…`, which falls back to the original when a resize fails |
+| `direct` | None: images are served as stored |
+
+Never build an image URL from a host and a key by hand, and never assume one
+host: the same theme serves stores on all three.
+
+### The product's representative image
+
+`productImageSource(product)` picks the URL of the merchant's cover, or the
+first usable gallery image, or `null`:
+
+```ts
+import { productImageSource } from "@wocart/storefront";
+
+const src = productImageSource(product);
+```
+
+`coverImage` is frequently null even when a product has photos. Reading it
+directly leaves empty squares in cards and baskets. It accepts a `Product` or
+a listed product.
+
+### A photo at the size the page shows it
+
+`mediaImageUrl(url, params, delivery)` asks the store's resizer for one size:
+
+```ts
+import { mediaImageUrl } from "@wocart/storefront";
+
+const card = src ? mediaImageUrl(src, { width: 400, height: 400, fit: "cover" }, config.media) ?? src : null;
+```
+
+`params` takes `width`, `height`, `quality` (1–100), `format` (`auto` lets the
+host pick the best format the browser accepts) and `fit` (`scale-down`,
+`contain`, `cover`, `crop`, `pad`, `squeeze`, read like CSS `object-fit`).
+
+It answers `null` when it cannot resize: no delivery, a `direct` delivery, or
+a URL the delivery does not serve. Show the original URL then, as the
+`?? src` above does. That fallback is why a store on `direct` still renders.
+
+### Width-based sources
+
+A responsive grid needs width descriptors with `sizes`, so a phone downloads a
+phone-sized file. `mediaImageSrcset(src, widths, { delivery, ratio, quality })`
+gives them:
+
+```astro
+---
+import { mediaImageSrcset, mediaImageUrl } from "@wocart/storefront";
+
+const { config } = Astro.locals.store;
+const srcset = mediaImageSrcset(src, [320, 480, 640, 960], { delivery: config.media, ratio: 1, quality: 82 });
+---
+<img
+  src={mediaImageUrl(src, { width: 640, height: 640, fit: "cover" }, config.media) ?? src}
+  srcset={srcset ?? undefined}
+  sizes="(min-width: 900px) 25vw, 50vw"
+  width="640"
+  height="640"
+  alt={product.name}
+  loading="lazy"
+/>
+```
+
+- With `ratio` (height ÷ width), each size is cropped to it (`cover`).
+  Without it, the photo keeps its shape and is never enlarged (`scale-down`).
+- Every size asks for `format: "auto"`.
+- It answers `null` exactly when `mediaImageUrl` would, or when no width is a
+  positive whole number. Leave `srcset` out then.
+- Set `width` and `height` on the `<img>` to reserve its box: that prevents
+  layout shift. A gallery's first image may use `loading="eager"`; the rest
+  stay lazy.
+
+### Image keys
+
+A media key, such as `products/3f2a9c.webp`, is an image's identity in the
+store's media. Its URL depends on the store's delivery, so it is derived at
+render and never stored:
+
+```ts
+import { isMediaKey, mediaUrl } from "@wocart/storefront";
+
+const url = mediaUrl("products/3f2a9c.webp", config.media); // null when it is not a key
+```
+
+`isMediaKey(value)` accepts a key that starts with one of the store's media
+folders (`products/`, `landing/`, `reviews/`), followed by segments of letters,
+digits, `.`, `_` and `-` that each start with a letter or digit, 512
+characters at most. `mediaUrl` answers `null` for anything else, and without a
+delivery.
+
+### An image the merchant picked
+
+A theme's `image` field stores a media key, an alt text and a focal point.
+`pictureOf(image, delivery)` turns it into what an `<img>` needs: its URL, its
+alt text (empty when the merchant wrote none), its size when known, and the
+focal point as `object-position` (`30% 70%`):
+
+```astro
+---
+import { pictureOf } from "@wocart/storefront";
+
+const picture = pictureOf(props.image, Astro.locals.store.config.media);
+---
+{picture && <img src={picture.src} alt={picture.alt} width={picture.width} height={picture.height} style={picture.position ? `object-position: ${picture.position}` : undefined} />}
+```
+
+It answers `null` when nothing is picked, the key is not a media key, or there
+is no delivery: render the section without the image then. Resize
+`picture.src` with `mediaImageUrl` like any other photo.
+
+## WhatsApp
+
+The WhatsApp button App owns the store's number, its texts and where the
+floating launcher shows. A theme owns only how it looks, and its own words for
+every text the merchant left empty. `whatsAppContact(config, page, words)` is
+the one way to read it:
+
+```ts
+import { whatsAppContact, type WhatsAppWords } from "@wocart/storefront";
+
+const words: WhatsAppWords = {
+  launcher: null,
+  caption: content.whatsappCaption,
+  welcome: content.whatsappWelcome,
+  cta: content.whatsappCta,
+  orderButton: content.whatsappOrderButton,
+  messages: {
+    general: content.whatsappGeneral, // e.g. "Hello {store}"
+    product: content.whatsappProduct, // e.g. "I would like to order {product}: {url}"
+    order: content.whatsappOrder, //     e.g. "My order number is {order}"
+  },
+};
+
+const contact = whatsAppContact(config, { kind: "product", product: product.name, url: Astro.url.href }, words);
+```
+
+It answers `null` when the store has no WhatsApp: the merchant has not set up
+the App, or the store cannot be read. Render no launcher and no WhatsApp link
+then, and never a fallback of your own.
+
+### What it resolves
+
+| Field | Value |
+| --- | --- |
+| `href` | The `wa.me` link to the store's number, with this page's message in it |
+| `launcherLabel`, `caption`, `welcomeMessage` | The merchant's text in the page's language, else your `launcher`, `caption`, `welcome` (each may be `null`: show nothing there) |
+| `ctaLabel` | The merchant's, else your `cta`: the panel's button, and the text of any other WhatsApp link |
+| `orderButtonLabel` | The merchant's, else your `orderButton`: the button on an order's confirmation or tracking page |
+| `agentName` | The merchant's agent, else the store's name |
+| `avatarUrl`, `accent` (`whatsapp` or `primary`), `position` (`right` or `left`), `attention` | How the merchant set the launcher up |
+| `surfaces` | Where the floating launcher shows: pass it to `showsWidgetOn` |
+
+The message is the page's own template, else the merchant's general one, else
+your message for that kind of page:
+
+| `page.kind` | Use it on | Template it takes first |
+| --- | --- | --- |
+| `general` | Every page about no product or order: home, listings, contact, the footer | The merchant's general message |
+| `product` | A product or landing page; pass `product` (its name) | The merchant's product message |
+| `order` | The order confirmation and order tracking; pass `order` (its number) | The merchant's order message |
+
+The message rules are the SDK's, applied for you:
+
+- `{store}`, `{product}`, `{url}` and `{order}` are filled in. `{product}`
+  falls back to the store's name when there is no product; `{order}` becomes
+  nothing when there is no order. An unknown placeholder stays as written.
+- `{url}` is `page.url` without its ad-click parameters (`utm_*`, `fbclid`,
+  `gclid` and the like): a shopper arriving from an ad does not hand the
+  merchant a tracking-laden link.
+- The message is capped at 900 characters (`MAX_RESOLVED_PREFILL_LENGTH`),
+  cut at a word.
+
+### Where to show the launcher
+
+```ts
+import { showsWidgetOn } from "@wocart/storefront";
+
+const { pathname } = Astro.locals.store; // without its language prefix
+
+if (contact && showsWidgetOn(contact.surfaces, pathname)) {
+  // Render the floating launcher.
+}
+```
+
+`showsWidgetOn` decides the floating launcher only. A WhatsApp link elsewhere
+(a footer, a contact card, the order button) shows whenever `contact` is not
+`null`. Pass the path **without** its language prefix: `/fr/products/robe`
+matches no page and shows no launcher. The switches and their pages are
+listed in [Store config](/sdk/storefront/config#whatsapp).
+
+### Keep it in one place
+
+Write your words once, in one module that wraps `whatsAppContact`, and call
+it from every place that links to WhatsApp: the launcher, the footer, the
+contact page, the order button. Never write a `wa.me` link or read
+`config.whatsapp` anywhere else. The [theme starter](/sdk/theme/starter)
+has the module (`src/lib/whatsapp.ts`, `storeWhatsApp`) and a guard test that
+fails on any other WhatsApp link.
+
+## Tracking
+
+A theme writes no pixel call of its own. The server decides which pixel a
+page reports to and which sale fires; the page carries the decision; the SDK
+executes it.
+
+```astro
+---
+import { trackingHead } from "@wocart/storefront/astro";
+const { config } = Astro.locals.store;
+---
+<head>
+  <Fragment set:html={trackingHead(config.pixelId)} />
+</head>
+<script>
+  import { storefrontTracking } from "@wocart/storefront";
+  storefrontTracking().start();
+</script>
+```
+
+`trackingHead(pixelId)` renders the `wocart:pixel` meta tag, Meta's library
+and the no-script page view, or nothing when the page reports to no pixel.
+Pass the pixel of the page: the store's `config.pixelId`, a landing page's
+`tracking.pixelId`, or on the thank-you page the order's (see
+[Checkout and OTP](/sdk/storefront/checkout)). `start()` initialises that
+pixel and reports the page and every page a soft navigation brings.
+
+Report the shopper's steps where they happen:
+
+```ts
+import { addedLines, storefrontTracking } from "@wocart/storefront";
+
+const tracking = storefrontTracking();
+tracking.productViewed({ productId: product.id, price: view.basePrice });
+
+const before = basket.getLines();
+tracking.addedToCart(addedLines(before, basket.addLine(line)));
+
+tracking.checkoutStarted({ lines: basket.getLines(), value: quote.subtotal });
+```
+
+Every event goes to the page's pixel alone (`trackSingle`), in Meta's
+catalog shape with `currency: "DZD"`. `addedToCart` reports what the tap put
+in — never the whole basket: a shopper adding one piece to a basket of five
+did not add six. `checkoutStarted` is reported once per page; send it on the
+first real interaction with the order form, with the value the server quoted.
+
+
+## A presentation checklist
+
+- Prices use `config.locale` and `config.currencySymbol`.
+- Product images come from `productImageSource`, not `coverImage` alone.
+- Every resized URL comes from `mediaImageUrl` or `mediaImageSrcset` with
+  `config.media`, with the original URL as the fallback.
+- `<img>` carries `width`, `height` and `alt`.
+- Every WhatsApp link comes from `whatsAppContact`, through one module that
+  holds the theme's words; the floating launcher also checks `showsWidgetOn`.
+- Meta payloads come from the builders; Purchase comes from `orders.tracking`.

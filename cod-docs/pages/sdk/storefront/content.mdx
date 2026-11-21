@@ -1,0 +1,235 @@
+---
+description: Read legal and custom pages, menus, landing pages and the saved page document for an editable theme.
+---
+
+import { Callout } from "zudoku/ui/Callout";
+
+# Pages and menus
+
+Store pages, menus and landing pages are merchant content. The SDK reads them;
+the theme decides where they sit and how they look.
+
+## Store pages
+
+`pages.get(slug)` returns a published legal or custom page:
+
+```ts
+import { notFound } from "@wocart/storefront/astro";
+
+const page = await store.pages.get(Astro.params.slug!);
+if (page === null) return notFound(Astro);
+
+page;
+// {
+//   id,
+//   kind: "terms" | "privacy" | "refund" | "shipping" | "custom",
+//   slug,
+//   locale,
+//   title,
+//   bodyHtml,
+//   metaTitle,
+//   metaDescription,
+// }
+```
+
+`bodyHtml` is already sanitised by the server. Render it with `set:html` and do
+not re-sanitise it into a different shape:
+
+```astro
+<article>
+  <h1>{page.title}</h1>
+  <div set:html={page.bodyHtml} />
+</article>
+```
+
+A draft, unpublished or unknown slug returns `null`. That is a real 404, not a
+page with no body.
+
+Resolve legal pages by `kind` when the rule names one. A merchant may rename a
+slug, but the Terms page is still `kind: "terms"`.
+
+```ts
+const terms = config.pages.find((item) => item.kind === "terms");
+```
+
+`pages.get` is fetched fresh on every call. A merchant's edit reaches the next
+server render, subject to your route cache.
+
+## Menus
+
+`menus.get(handle)` returns a menu tree:
+
+```ts
+const menu = await store.menus.get("main-menu");
+
+menu;
+// {
+//   handle: "main-menu",
+//   title: "Main menu",
+//   items: [
+//     {
+//       label: "Women",
+//       href: "/category/women",
+//       type: "category",
+//       children: [],
+//     },
+//   ],
+// }
+```
+
+Every item has:
+
+| Field | Meaning |
+| --- | --- |
+| `label` | In the client's language when translated |
+| `href` | A store path without language prefix, or the merchant's absolute URL |
+| `type` | The destination: `home`, `catalog`, `search`, `trackOrder`, `contact`, `category`, `collection`, `product`, `page`, `landing` or `url` |
+| `children` | Nested items; a menu has at most three levels and 100 items |
+
+The server turns every destination into its path, so a theme never builds a
+menu link itself: render `href` as it is. A `url` item is the merchant's own
+address: a path of this store, an `http(s)` address, a `mailto:` or `tel:`
+link, or a `#`/`?` fragment; the server refuses anything else. Items that lead
+nowhere public are already removed. Do not re-check visibility.
+
+A new store's footer menu links order tracking and the contact page, so a
+theme that renders the store's menus reaches those pages without a link of
+its own.
+
+Localize only store paths; `localizeHref` leaves external URLs alone:
+
+```astro
+---
+import { localizeHref } from "@wocart/storefront";
+---
+<a href={localizeHref(item.href, config.locale, routing)}>{item.label}</a>
+```
+
+An unknown menu or a failed read returns `null`. Render your own fallback
+navigation, not an empty header.
+
+A menu is a tree, so render it recursively and preserve RTL/LTR with the page's
+`dir`. The SDK does not render it for you.
+
+## Landing pages
+
+`pages.landing(slug)` returns a published landing page with an ordered image
+stack, optionally one linked product, and its own page document:
+
+```ts
+import { notFound } from "@wocart/storefront/astro";
+
+const landing = await store.pages.landing(Astro.params.slug!);
+if (landing === null) return notFound(Astro);
+```
+
+The shape:
+
+```ts
+type LandingPage = {
+  id: string;
+  slug: string;
+  name: string;
+  status: "draft" | "published" | "archived";
+  imageGap: number;
+  metaTitle: string | null;
+  metaDescription: string | null;
+  publishedAt: string | null;
+  images: Array<{
+    id: string;
+    key: string;
+    url: string;
+    altText: string | null;
+    position: number;
+    width: number | null;
+    height: number | null;
+  }>;
+  product: Product | null;
+  tracking: {
+    pixelId: string | null;
+  };
+  document: PageDocumentPayload | null;
+};
+```
+
+`images` is ordered by `position`; `imageGap` is the space between them in
+pixels. Width and height are captured at upload, so reserve the box and avoid a
+layout shift.
+
+`product` is a full product, not a list card. The order form can use it
+unchanged. It is `null` when the product is no longer public; in that case show
+the landing content without an order form.
+
+A draft, archived or unknown landing page returns `null`. Answer it with
+`notFound(Astro)`: a real 404 that is never cached, so the page shows the
+moment the merchant publishes it. A redirect to the home page would answer an
+ad's link with a 200, a soft 404 for search engines and ad reviews.
+
+The page's `tracking` is already resolved. Use that pixel and event, not the
+store's default pixel, when the landing page fires its browser event.
+
+`document` is this landing page's own composition for the client's `theme`
+(its `lp:<id>` page document), or `null` when it has none or the client names
+no theme: the theme then renders its `landing` surface's default. Render it
+with `resolveSurfaceDocument(theme, landingSurface(landing.id), landing.document, scope)`
+from `@wocart/theme`; [Pages and rendering](/sdk/theme/pages) covers landing
+pages.
+
+`pages.landing(slug, { preview: true })` also answers a draft and counts no
+visit. It is for an editor's preview only; a shopper's page never passes it.
+
+## The saved page document
+
+An editable theme reads the store's composition document with
+`pageData.get(surface)`:
+
+```ts
+const document = await store.pageData.get("home");
+```
+
+The transport shape is deliberately loose:
+
+```ts
+type PageDocumentPayload = {
+  version: number;
+  surface: string;
+  sections: unknown[];
+  [key: string]: unknown;
+};
+```
+
+`sections` stays `unknown[]` so a newer document reaches your theme unchanged.
+The meaning of a section belongs to the theme schema. Do not cast it to your local section type; the [Theme SDK](/sdk/theme) reads it.
+
+Render it with `resolveSurfaceDocument` from `@wocart/theme`, which picks the
+saved document or the theme's default, repairs and completes it, and reports
+what it changed:
+
+```ts
+import { resolveSurfaceDocument } from "@wocart/theme";
+
+const { page, source, issues } = resolveSurfaceDocument(theme, "home", document, scope);
+```
+
+See [Pages and rendering](/sdk/theme/pages#what-renders).
+
+With `theme` set on the client, the server returns that theme's document for the
+surface. Without it, the server returns the most recently saved document for the
+surface. A store with no saved document returns `null`; render your shipped
+default.
+
+<Callout type="info" title="Read side only">
+Page documents are written by Wocart Studio, never by a storefront: the
+public API has no endpoint that writes one. Read `pageData`, render it, and
+keep your theme's editing contract in `@wocart/theme`.
+</Callout>
+
+## A page-rendering checklist
+
+- A store page uses `pages.get` and answers a real 404 on `null`.
+- A legal page resolves its link through `kind`, not a hardcoded slug.
+- A menu recurses through `children` and localizes only internal paths.
+- A landing page uses its own `tracking`, not `config.pixelId`.
+- An editable surface uses `pageData.get(surface)` and `resolveSurfaceDocument`.
+- A missing document renders the theme's default, not an empty page.
+- The route cache is aware of how often each of these can change.

@@ -1,0 +1,62 @@
+{
+  "page_title": "Customer groups",
+  "search_placeholder": "Search groups...",
+  "new_group": "New group",
+  "create_group": "Create group",
+  "success_deleted": "Group deleted",
+  "error_delete_failed": "Failed to delete group",
+  "error_load": "Could not load customer groups",
+  "error_not_found": "Customer group not found",
+  "error_generic": "Something went wrong. Please try again.",
+  "error_group_has_members": "Cannot delete a group that still has members",
+  "error_duplicate_name": "A group with this name already exists",
+  "actions": {
+    "view": "View",
+    "edit": "Edit",
+    "delete": "Delete"
+  },
+  "empty_state": {
+    "title": "No groups yet",
+    "description": "Create groups to segment and organize your customer base based on their behavior and preferences.",
+    "action": "Create your first group"
+  },
+  "table": {
+    "name": "Name",
+    "description": "Description",
+    "members": "Members",
+    "created": "Created"
+  },
+  "detail": {
+    "members": "Members",
+    "no_members": "No members in this group",
+    "add_member": "Add customer",
+    "remove_member": "Remove from group",
+    "member_added": "Customer added to group",
+    "member_removed": "Customer removed from group",
+    "search_add": "Search customer...",
+    "no_available": "No customers available to add",
+    "search_members": "Search members...",
+    "orders_label": "orders"
+  },
+  "form": {
+    "title_add": "Add group",
+    "title_edit": "Edit group",
+    "name_label": "Group name",
+    "name_placeholder": "e.g. VIP, wholesale, inactive...",
+    "description_label": "Description (optional)",
+    "description_placeholder": "Short description of the group",
+    "color_label": "Color",
+    "cancel": "Cancel",
+    "success_add": "Group created",
+    "success_edit": "Group updated",
+    "error_required": "Please fill in all required fields"
+  },
+  "tags": {
+    "label": "Tags",
+    "placeholder": "Add a tag...",
+    "add": "Add tag",
+    "empty": "No tags"
+  },
+  "count_one": "{count} group",
+  "count_other": "{count} groups"
+}

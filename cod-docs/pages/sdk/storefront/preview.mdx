@@ -1,0 +1,227 @@
+---
+description: Render an editor's draft without storing it, lock the response to that editor, and drop cached pages when a publish lands.
+---
+
+import { Callout } from "zudoku/ui/Callout";
+
+# Preview and revalidation
+
+Two platform signals reach a storefront:
+
+- **Preview** — an editor frames the storefront and sends it an unsaved draft.
+- **Revalidation** — a publish changed what the pages show, so cached pages
+  must be dropped.
+
+Both are signed requests from another origin. Both fail closed when the
+deployment has no preview key.
+
+## Preview
+
+A preview is a token-bearing GET, then same-origin POSTs with drafts:
+
+```text
+GET  /wocart-preview?token=…&surface=home
+POST /wocart-preview   { token, draft }
+```
+
+The first render shows what is saved. The editor then posts a draft — page
+document, theme settings, text edits — and the framed page re-renders it. The
+draft is never written to the database.
+
+### Read the request
+
+`readPreviewRequest` lives on the server entry point and does all the
+checking. `createStorefrontMiddleware` calls it for you on the preview path;
+call it yourself only in a middleware you wire by hand:
+
+```ts
+import { readPreviewRequest } from "@wocart/storefront/server";
+import { WOCART_PREVIEW_KEY } from "astro:env/server";
+
+const preview = await readPreviewRequest(request, { publicKey: WOCART_PREVIEW_KEY, theme: THEME_KEY });
+```
+
+The result is either `{ ok: true, claims, draft, token }` or `{ ok: false,
+status, reason }`.
+
+It guarantees:
+
+- GET must carry `token`, `surface`, and optionally `locale` and `path`.
+- POST must come from the storefront's own origin, as JSON, under 1 MB.
+- The token is Ed25519 (`EdDSA`) and made for this storefront and this theme.
+- A token made for revalidation cannot open a preview.
+- The token lives at most one hour.
+- The draft is bounded and shape-checked.
+
+Without a key, every preview request is a 404. That is how preview stays off.
+
+### Response headers
+
+Every preview response carries:
+
+```ts
+import { previewResponseHeaders } from "@wocart/storefront/server";
+
+for (const [name, value] of Object.entries(previewResponseHeaders(claims))) {
+  Astro.response.headers.set(name, value);
+}
+```
+
+| Header | Value | Why |
+| --- | --- | --- |
+| `Cache-Control` | `private, no-store` | A draft must never be cached |
+| `Content-Security-Policy` | `frame-ancestors <editor>` | Only the token's editor may frame it |
+| `X-Robots-Tag` | `noindex, nofollow` | A draft must not be indexed |
+| `Referrer-Policy` | `same-origin` | The token in the URL must not leak |
+
+Do not add a route cache rule for the preview path. A cached preview would show
+one merchant's draft to another visitor.
+
+### Render the draft
+
+`resolvePreviewStore(draft, { client, fallback })` from
+`@wocart/storefront/astro` builds the store as the draft would leave it: the
+draft's theme settings and text edits over the saved ones, in the draft's
+language when the store serves it (else the primary), with `pixelId` `null` —
+a preview is not a visit. Its `pathname` is the draft's `path`, else `/`.
+`previewConfig(config, draft)` is the same overlay for a config you already
+hold.
+
+- `draft.settings` replaces `themeSettings`.
+- `draft.content` replaces the text edits of the languages it names.
+- `draft.document` is the page document to render instead of the saved one;
+  an editable theme reads it like a saved document, through
+  `@wocart/theme`'s `resolveSurfaceDocument`. This SDK does not interpret
+  section shapes.
+
+### A preview route
+
+A preview is rendered by a normal Astro page that is never prerendered. The
+middleware opens it **before** resolving the request's store, because the
+draft's surface and language decide the store. `createStorefrontMiddleware`
+does this when given the preview route and key:
+
+```ts
+// src/middleware.ts
+export const onRequest = createStorefrontMiddleware({
+  client: createStore,
+  fallback,
+  preview: { path: THEME_PREVIEW_PATH, publicKey: () => WOCART_PREVIEW_KEY, theme: THEME_KEY },
+  context: buildStoreContext,
+  getActionContext,
+});
+```
+
+A refused token answers its status with `Cache-Control: no-store`; a
+verified one sets `locals.store` from `resolvePreviewStore` and
+`locals.preview` to `{ claims, draft, token }`, and never runs a form action.
+
+The page then renders the draft and sets the headers above:
+
+```astro
+---
+// src/pages/wocart-preview.astro
+import { previewResponseHeaders } from "@wocart/storefront/server";
+
+export const prerender = false;
+
+const preview = Astro.locals.preview;
+if (preview === undefined) return new Response(null, { status: 404, headers: { "Cache-Control": "no-store" } });
+for (const [name, value] of Object.entries(previewResponseHeaders(preview.claims))) {
+  Astro.response.headers.set(name, value);
+}
+---
+```
+
+An editable theme completes the page with `previewTarget` and the preview
+bridge; the [theme starter](/sdk/theme/starter) has every file
+(`src/middleware.ts`, `src/pages/wocart-preview.astro`,
+`src/pages/wocart-revalidate.ts`): a signed token opens the preview, a draft posted from the
+page's own origin re-renders, a draft posted from another origin is refused
+with 403, and a revalidation token is refused on the preview route.
+
+The path `/wocart-preview` is the platform's (`THEME_PREVIEW_PATH` in
+`@wocart/theme`): Wocart Studio frames that path.
+
+<Callout type="caution" title="A preview token is a capability">
+Any page that holds the token can frame the preview. Keep the URL out of
+referrers, logs and analytics; the headers above do the first, and your logging
+must do the rest. The token can only render a draft — it cannot write or purge.
+</Callout>
+
+## Revalidation
+
+A publish changes the store's page data. The platform posts a signed token to
+the theme's revalidation route (`REVALIDATE_PATH`, `/wocart-revalidate`), and
+the theme drops its cached pages. `revalidateEndpoint` is the whole route:
+
+```ts
+// src/pages/wocart-revalidate.ts
+import { WOCART_PREVIEW_KEY } from "astro:env/server";
+import { revalidateEndpoint } from "@wocart/storefront/astro";
+
+export const prerender = false;
+export const { POST, ALL } = revalidateEndpoint({ publicKey: () => WOCART_PREVIEW_KEY, theme: THEME_KEY });
+```
+
+`POST` answers 204 after dropping every page cached under `PAGES_CACHE_TAG`
+for a verified token, and the token's refusal status otherwise, dropping
+nothing. `ALL` answers any other method 405. No answer is cached. A route
+wired by hand reads the request with `readRevalidateRequest`.
+
+The checks:
+
+- `POST` only.
+- `Authorization: Bearer <jws>`.
+- The token is signed with the deployment key.
+- `use` must be `"revalidate"`; a preview token is refused.
+- `aud` must be this storefront origin.
+- `theme` must be this theme's key.
+- `iat`/`exp` span at most five minutes.
+
+A preview token cannot purge a cache; a revalidation token cannot open a
+preview.
+
+### Drop the pages
+
+`PAGES_CACHE_TAG` (`"pages"`, from `@wocart/storefront/server`) is the tag
+the route drops. Every cached page route in `astro.config.mjs`'s
+`routeRules` must carry it; a route that omits it is not purged on publish.
+
+```js
+// astro.config.mjs
+import { PAGES_CACHE_TAG } from "@wocart/storefront/server";
+
+export default defineConfig({
+  routeRules: {
+    "/products/[handle]": {
+      maxAge: 60,
+      swr: 86400,
+      tags: ["products", PAGES_CACHE_TAG],
+    },
+  },
+});
+```
+
+The revalidation path needs no store: `createStorefrontMiddleware` lets it
+through, and a middleware wired by hand must too, or a purge would depend on
+a store read.
+
+<Callout type="info" title="Where the token comes from">
+The platform signs preview and revalidation tokens with its own private key;
+the storefront only checks them with the deployment's public key. The storefront
+cannot mint either token. `WOCART_PREVIEW_KEY` is optional: without it, preview
+and revalidation are both off and answer 404.
+</Callout>
+
+## A preview and caching checklist
+
+- The preview route is `prerender = false`.
+- The route is excluded from every cache rule.
+- Every preview response sets `previewResponseHeaders`.
+- `previewConfig` is applied before rendering.
+- The theme reads the preview draft's document; the SDK does not interpret it.
+- The revalidation route checks the bearer token and theme.
+- Cache pages carry a tag; revalidation invalidates that same tag.
+- Both routes answer 404 when no preview key is configured.
+- The store's pixel is absent in preview.

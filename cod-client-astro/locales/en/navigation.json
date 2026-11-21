@@ -1,0 +1,65 @@
+{
+  "sidebar": {
+    "dashboard": "Home",
+    "orders": "Orders",
+    "orders_abandoned": "Abandoned",
+    "customers": "Customers",
+    "products": "Products",
+    "collections": "Collections",
+    "categories": "Categories",
+    "customer_groups": "Groups",
+    "customer_tags": "Tags",
+    "delivery": "Delivery",
+    "delivery_drivers": "Drivers",
+    "delivery_companies": "Carriers",
+    "delivery_shipping": "Shipping rates",
+    "team": "Team",
+    "settings": "Settings",
+    "general": "Main menu",
+    "reviews": "Reviews",
+    "offers": "Offers",
+    "coupons": "Coupons",
+    "landing_pages": "Landing pages",
+    "stock_management": "Stock",
+    "mcp": "AI agents",
+    "store_pages": "Pages",
+    "navigation_menus": "Navigation",
+    "checkout_form": "Checkout form",
+    "online_store": "Online store",
+    "delivery_labels": "Labels",
+    "integrations": "Integrations",
+    "apps": "Apps",
+    "orders_spam": "Spam",
+    "orders_team": "Confirmation team",
+    "costs": "Costs"
+  },
+  "navbar": {
+    "search_placeholder": "Search orders, customers, tracking…"
+  },
+  "theme": {
+    "label": "Appearance",
+    "light": "Light",
+    "dark": "Dark"
+  },
+  "menu": {
+    "open": "Open menu",
+    "close": "Close menu",
+    "collapse_group": "Hide",
+    "expand_group": "Show"
+  },
+  "account": {
+    "label": "Your account",
+    "profile": "Your profile",
+    "sign_out": "Sign out"
+  },
+  "skip_to_content": "Skip to content",
+  "language": {
+    "label": "Language",
+    "arabic": "العربية",
+    "english": "English",
+    "french": "Français"
+  },
+  "badge": {
+    "new": "New"
+  }
+}

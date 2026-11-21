@@ -1,0 +1,117 @@
+import { useEffect, useState } from "react";
+import { ArrowLeft } from "lucide-react";
+import {
+  canScope,
+  useIdentity,
+} from "@/features/auth/components/RequireAuth";
+import { Alert, Button } from "@/components/ui";
+import { useT } from "@/i18n/react";
+import { SCOPES } from "../../../../../cod-shared/rbac/scopes";
+import {
+  getDriver,
+  listDriverCompensations,
+} from "@/features/delivery/api";
+import { listWilayas } from "@/features/geography/api";
+import {
+  driverErrorMessage,
+  driverFullName,
+  driverInitials,
+} from "@/features/delivery/model";
+import type {
+  Driver,
+  DriverCompensation,
+  Wilaya,
+} from "@/features/delivery/types";
+import { DriverCompensationsSection } from "@/features/delivery/components/DriverCompensationsSection";
+
+function Loading() {
+  return (
+    <div role="status" aria-busy="true" className="space-y-4">
+      <div className="h-20 shimmer rounded-xl" />
+      <div className="h-72 shimmer rounded-xl" />
+    </div>
+  );
+}
+
+export function DriverCompensationsDetail({ driverId }: { driverId: string }) {
+  const t = useT("delivery");
+  const common = useT("common");
+  const auth = useT("auth");
+  const identity = useIdentity();
+  const [driver, setDriver] = useState<Driver | null>(null);
+  const [compensations, setCompensations] = useState<DriverCompensation[]>([]);
+  const [wilayas, setWilayas] = useState<Wilaya[]>([]);
+  const [error, setError] = useState<string | null>(null);
+
+  async function load() {
+    setError(null);
+    try {
+      const [nextDriver, nextCompensations, nextWilayas] = await Promise.all([
+        getDriver(driverId),
+        listDriverCompensations(driverId),
+        listWilayas(),
+      ]);
+      setDriver(nextDriver);
+      setCompensations(nextCompensations);
+      setWilayas(nextWilayas);
+    } catch (cause) {
+      setError(driverErrorMessage(cause, t));
+    }
+  }
+  useEffect(() => {
+    if (canScope(identity, SCOPES.DELIVERY_READ)) void load();
+  }, [driverId, identity?.role, identity?.scopes.join(",")]);
+
+  if (!canScope(identity, SCOPES.DELIVERY_READ))
+    return (
+      <Alert role="alert" tone="critical">
+        {auth("no_access")}
+      </Alert>
+    );
+  if (error && !driver)
+    return (
+      <Alert role="alert" tone="critical">
+        <span className="flex-1">{error}</span>
+        <Button type="button" variant="ghost" onClick={() => void load()}>
+          {common("retry")}
+        </Button>
+      </Alert>
+    );
+  if (!driver) return <Loading />;
+
+  return (
+    <div className="mx-auto max-w-3xl space-y-5">
+      <a
+        href={`/delivery/drivers/${encodeURIComponent(driver.id)}`}
+        className="inline-flex items-center gap-2 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
+      >
+        <ArrowLeft size={14} className="rtl:rotate-180" aria-hidden="true" />
+        {t("actions.back_to_driver")}
+      </a>
+      <a
+        href={`/delivery/drivers/${encodeURIComponent(driver.id)}`}
+        className="flex items-center gap-3 rounded-xl bg-card p-3 transition-colors hover:bg-muted/10 shadow-card"
+      >
+        <span className="grid size-10 shrink-0 place-items-center rounded-xl bg-primary text-sm font-semibold text-primary-foreground">
+          {driverInitials(driver)}
+        </span>
+        <div className="min-w-0 flex-1">
+          <p className="truncate text-sm font-semibold text-foreground">
+            {driverFullName(driver)}
+          </p>
+          <p
+            className="truncate text-xs font-medium text-muted-foreground"
+            dir="ltr"
+          >
+            {driver.phone}
+          </p>
+        </div>
+      </a>
+      <DriverCompensationsSection
+        driver={driver}
+        compensations={compensations}
+        wilayas={wilayas}
+      />
+    </div>
+  );
+}

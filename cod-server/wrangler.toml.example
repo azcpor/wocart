@@ -1,0 +1,189 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# CodFlow server — Cloudflare Worker configuration
+#
+# EVERY value below is a placeholder you must replace with your own resources.
+# Nothing in this repo depends on a specific Cloudflare account, domain, or
+# database. See README.md → "Getting Started" for step-by-step setup.
+#
+#   wrangler d1 create codflow-os-db  → gives you a database_id
+#   wrangler r2 bucket create codflow-images   (only for a store on R2)
+#   wrangler kv namespace create RATE_LIMIT
+#   wrangler kv namespace create OAUTH_KV
+#   wrangler deploy
+# ─────────────────────────────────────────────────────────────────────────────
+
+name = "codflow-server"
+main = "src/index.ts"
+compatibility_date = "2024-11-27"
+compatibility_flags = ["nodejs_compat", "global_fetch_strictly_public"]
+
+# D1 database binding.
+[[d1_databases]]
+binding = "DB"
+database_name = "codflow-os-db"
+# Replace with the id from `wrangler d1 create codflow-os-db`.
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "src/db/migrations"
+
+# R2 bucket: the store's media when MEDIA_HOST is r2, as in local development.
+# A store on ImageKit has no bucket: leave this block out, and its Cloudflare
+# account never needs R2.
+# Replace with the name from `wrangler r2 bucket create codflow-images`.
+[[r2_buckets]]
+binding = "MEDIA_BUCKET"
+bucket_name = "codflow-images"
+
+# Cloudflare Images binding — a review photo becomes WebP as it arrives (EXIF
+# and GPS gone), and an AI agent's landing image too (billed as unique
+# transformations; 5,000/month free tier). Without it reviews take no photos.
+[images]
+binding = "IMAGE_TRANSFORM"
+
+# KV namespace for rate limiting.
+[[kv_namespaces]]
+binding = "RATE_LIMIT"
+id = "00000000000000000000000000000000"
+
+# KV namespace for the MCP OAuth provider (clients, grants, tokens, props).
+# Create with: wrangler kv namespace create OAUTH_KV
+[[kv_namespaces]]
+binding = "OAUTH_KV"
+id = "00000000000000000000000000000000"
+
+# Review photos and voice notes also need the REVIEW_UPLOAD_SECRET secret
+# (`wrangler secret put REVIEW_UPLOAD_SECRET`, any long random value); without
+# it, the storefront takes text reviews only.
+
+# Review attempts per order number (a phone cannot be guessed for one order).
+# namespace_id: any positive integer unique in your Cloudflare account.
+# The events queue (https://docs.wocart.store/architecture). It carries only "work is due": this
+# Worker consumes it and drains — the carriers' webhook inbox and the Business
+# Events' Deliveries, whose state lives in D1. Create it once per store:
+#   wrangler queues create codflow-events
+# One message per invocation, a few retries, no dead-letter queue: a lost
+# message loses nothing, the five-minute schedule drains too.
+[[queues.producers]]
+binding = "EVENTS_QUEUE"
+queue   = "codflow-events"
+
+[[queues.consumers]]
+queue          = "codflow-events"
+max_batch_size = 1
+max_retries    = 3
+
+[[ratelimits]]
+name = "REVIEW_RATE_LIMITER"
+namespace_id = "1001"
+simple = { limit = 10, period = 60 }
+
+# Cron Triggers
+# Hourly: sweeps pending abandoned orders → abandoned status (maximum lag from
+#   "true abandonment" to "marked abandoned" is ~90 min, pending > 30 min).
+# Every 5 minutes: the delivery pipeline — retries webhook events whose
+#   processing failed, settles stale handoffs, looks unknown handoffs up, and
+#   syncs EcoTrack, NOEST and Guepex parcels (they send no webhooks).
+[triggers]
+crons = ["0 * * * *", "*/5 * * * *"]
+
+# Environment variables (non-secret).
+#
+# Local dev defaults work out of the box. For a deployed worker, replace the
+# URLs with your own public domains:
+#   WORKER_URL       → https://api.yourdomain.com      (your Worker's public URL)
+#   STOREFRONT_URL   → https://store.yourdomain.com    (optional fallback for landing
+#                      page share URLs when the merchant hasn't set their store domain
+#                      in Store Settings yet)
+#   BETTER_AUTH_URL  → https://dashboard.yourdomain.com/api/auth (the dashboard
+#                       Worker's Better Auth origin — JWT issuer verified here)
+#   WORKER_SELF_URL  → https://api.yourdomain.com/     (this Worker's own origin;
+#                       required `aud` claim for MCP bearer tokens)
+#
+# Media (https://docs.wocart.store/self-hosting/media): where the store's files are kept, and how browsers
+# fetch them. Locally: this Worker's own bucket, served by GET /media/:key —
+# no account, no credentials. Deployed, ImageKit keeps and delivers them:
+#   MEDIA_HOST           → imagekit
+#   MEDIA_DELIVERY       → imagekit
+#   IMAGEKIT_PUBLIC_KEY  → public_…            (ImageKit → Developer options)
+#   IMAGEKIT_FOLDER      → /stores/your-store  (the store's folder; one account holds many)
+#   MEDIA_ORIGIN         → https://ik.imagekit.io/your_imagekit_id/stores/your-store
+#                          (the URL endpoint followed by IMAGEKIT_FOLDER)
+#   and the secret: wrangler secret put IMAGEKIT_PRIVATE_KEY --env production
+# Or keep them in R2: MEDIA_HOST = "r2", MEDIA_DELIVERY = "cloudflare" (resized
+# by Cloudflare Images on your zone) and MEDIA_ORIGIN = "https://media.yourdomain.com",
+# the bucket's custom domain.
+[vars]
+ENVIRONMENT = "development"
+WORKER_URL = "http://localhost:8787"
+MEDIA_HOST = "r2"
+MEDIA_DELIVERY = "direct"
+MEDIA_ORIGIN = "http://localhost:8787/media"
+BETTER_AUTH_URL = "http://localhost:4321/api/auth"
+WORKER_SELF_URL = "http://localhost:8787/"
+# Development allows all origins for easier testing. Production uses ALLOWED_ORIGINS.
+ALLOWED_ORIGINS = "*"
+
+# Production environment.
+# Deploy with `wrangler deploy --env production` after editing the values.
+# IMPORTANT: Set ALLOWED_ORIGINS to your actual dashboard and storefront domains.
+[env.production]
+vars = { ENVIRONMENT = "production", WORKER_URL = "https://api.example.com", MEDIA_HOST = "imagekit", MEDIA_DELIVERY = "imagekit", MEDIA_ORIGIN = "https://ik.imagekit.io/your_imagekit_id/stores/your-store", IMAGEKIT_PUBLIC_KEY = "public_your_key", IMAGEKIT_FOLDER = "/stores/your-store", BETTER_AUTH_URL = "https://dashboard.example.com/api/auth", WORKER_SELF_URL = "https://api.example.com/", ALLOWED_ORIGINS = "https://dashboard.example.com,https://store.example.com", STOREFRONT_URL = "https://store.example.com" }
+
+# This store keeps its media on ImageKit, so it declares no bucket. A store on
+# R2 sets MEDIA_HOST = "r2", MEDIA_DELIVERY = "cloudflare", MEDIA_ORIGIN to its
+# bucket's domain, and declares it:
+#   [[env.production.r2_buckets]]
+#   binding = "MEDIA_BUCKET"
+#   bucket_name = "codflow-images"
+
+[env.production.images]
+binding = "IMAGE_TRANSFORM"
+
+# Environment bindings are non-inheritable in Wrangler — every binding used by
+# the Worker must be declared here or a production deploy silently ships without it.
+[[env.production.d1_databases]]
+binding = "DB"
+database_name = "codflow-os-db"
+database_id = "00000000-0000-0000-0000-000000000000"
+
+[[env.production.kv_namespaces]]
+binding = "RATE_LIMIT"
+id = "00000000000000000000000000000000"
+
+[[env.production.kv_namespaces]]
+binding = "OAUTH_KV"
+id = "00000000000000000000000000000000"
+
+[[env.production.queues.producers]]
+binding = "EVENTS_QUEUE"
+queue   = "codflow-events"
+
+[[env.production.queues.consumers]]
+queue          = "codflow-events"
+max_batch_size = 1
+max_retries    = 3
+
+[[env.production.ratelimits]]
+name = "REVIEW_RATE_LIMITER"
+namespace_id = "1001"
+simple = { limit = 10, period = 60 }
+
+# Share local D1 state with the dashboard so both read the same SQLite file in
+# dev. `persist_to` under [dev] is not a wrangler 3.x field (hence the old
+# warning); the shared path is wired in via --persist-to in package.json dev +
+# migration scripts, and astro dev's persistState in cod-client-astro.
+# Shared path resolves to <repo-root>/.wrangler-shared.
+[dev]
+port = 8787
+
+# Workers Logs: every line the server writes (its warnings and errors: a
+# failed wake, a schedule pass that failed, an unexpected error), kept for
+# the store's support. No line per request — the server writes none of its
+# own, and that is what would grow with traffic. Wocart Cloud deploys
+# stores with the same setting.
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+invocation_logs = false

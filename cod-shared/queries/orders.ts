@@ -1,0 +1,1010 @@
+/**
+ * Orders Queries
+ *
+ * Centralized database operations for orders management.
+ */
+
+import { MAX_ORDER_NUMBER_DRAWS, drawOrderNumber, isOrderNumberCollision } from "../lib/order-number";
+import type { AppDb } from "../db/client";
+import {
+  orders,
+  orderProducts,
+  businessEvents,
+  customers,
+  productVariants,
+  products,
+  drivers,
+  wilayas,
+  communes,
+  stockMovements,
+  deliveryCompanies,
+  shipments,
+  stores,
+  orderAttribution,
+} from "../db/schema";
+import { statusMovedOn, type OrderStatus, type SeenOrder } from "../orders/lifecycle";
+import type { StoreLocale } from "../i18n/locales";
+import {
+  eq,
+  desc,
+  asc,
+  and,
+  like,
+  or,
+  sql,
+  getTableColumns,
+  aliasedTable,
+  isNull,
+  isNotNull,
+  inArray,
+  ne,
+} from "drizzle-orm";
+
+const driversAlias = aliasedTable(drivers, "d");
+
+import { safeLikeTerm } from "./search";
+import { orderNeedsAttentionSql, orderStageSql } from "../orders/stage-sql";
+import type { OrderStage } from "../orders/stage";
+import type { ShipmentKind } from "../shipments/model";
+import type { RuleMatch } from "../order-screening/rules";
+
+type BatchStatement = Parameters<AppDb["batch"]>[0][number];
+import { linesToRestock, restockStatements } from "../inventory/restock";
+import { getCustomerByPhone, updateCustomer, type UpdateCustomerData } from "./customers";
+import { creditOf, staffOf, type Author } from "../events/actor";
+import { assignedOnCreate, assignmentOnCreate } from "../team/assign";
+import { WAITING_STATUSES, type AssignmentWay } from "../team/model";
+import { inTeamQueue, type TeamQueue } from "../team/queue";
+import { inCallList, type CallList } from "../orders/calls";
+import { ORDER_STATUS_EVENT, ORDER_STATUS_OF_EVENT, type OrderField, type OrderProcessingEvent } from "../events/catalogue";
+import { recordEvent } from "../events/record";
+import { orderSnapshot } from "../events/snapshots";
+import { enteredAttributionRow } from "../attribution/resolve";
+import { orderAttributionView, orderSourceSummary } from "../attribution/view";
+import type { OrderChannel } from "../attribution/model";
+
+export interface OrderFilters {
+  status?: (typeof orders.$inferSelect)["status"] | "all";
+  /** Where the order stands overall (stage.ts): any of these. */
+  stage?: readonly OrderStage[];
+  /** Only orders whose delivery needs the merchant (true), or only the others (false). */
+  attention?: boolean;
+  /** Only orders handed to a carrier, or to the store's driver. */
+  kind?: ShipmentKind;
+  /** Only orders Order Protection flagged. */
+  flagged?: boolean;
+  /** Only orders from these channels; `unknown` is an order whose source is not known. */
+  channel?: readonly (OrderChannel | "unknown")[];
+  /** Archived orders: left out (default), the only ones, or included. */
+  archived?: "exclude" | "only" | "include";
+  orderType?: (typeof orders.$inferSelect)["orderType"];
+  /** Only orders with this team member; null: only orders with nobody. */
+  assigneeId?: string | null;
+  /** Only orders whose customer asked to be called back and that still wait, the soonest callback first. */
+  callback?: "set";
+  /** Only orders on no answer after this many calls; 3 takes every later call too (orders/calls.ts). */
+  calls?: CallList;
+  /** Only the orders in one of the confirmation team's queues (team/queue.ts). */
+  teamQueue?: TeamQueue;
+  wilayaId?: number;
+  search?: string;
+  limit?: number;
+  offset?: number;
+  /**
+   * Opaque keyset cursor (`nextOrderCursor` output): return the rows after
+   * it in the list's order. Takes precedence over offset when set.
+   */
+  cursor?: string;
+}
+
+/** The cursor of the page after `last`, in the list's order: newest first, or for callbacks the soonest first. */
+export function nextOrderCursor(filters: Pick<OrderFilters, "callback">, last: { createdAt: string; callbackAt: string | null; id: string }): string {
+  return encodeOrderCursor(filters.callback === "set" && last.callbackAt ? last.callbackAt : last.createdAt, last.id);
+}
+
+export function encodeOrderCursor(createdAt: string, id: string): string {
+  return btoa(`${createdAt}|${id}`)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+export function parseOrderCursor(
+  cursor: string,
+): { createdAt: string; id: string } | null {
+  try {
+    const b64 = cursor.replace(/-/g, "+").replace(/_/g, "/");
+    const decoded = atob(b64);
+    const sep = decoded.lastIndexOf("|");
+    if (sep <= 0) return null;
+    const createdAt = decoded.slice(0, sep);
+    const id = decoded.slice(sep + 1);
+    if (!id) return null;
+    if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(createdAt)) return null;
+    return { createdAt, id };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * An order's columns as a response shows them. The shopper's ad-click
+ * signals (fbc, fbp, IP address, user agent) are kept for the conversions
+ * the server reports, and the checkout key only to place the order once;
+ * neither is shown.
+ */
+const { fbc: _fbc, fbp: _fbp, ipAddress: _ipAddress, userAgent: _userAgent, checkoutKey: _checkoutKey, revision: _revision, ...orderResponseColumns } = getTableColumns(orders);
+
+/**
+ * Get all orders with optional filtering.
+ * Joins wilayas + communes to return Arabic display names.
+ */
+export async function getAllOrders(db: AppDb, filters: OrderFilters = {}) {
+  const conditions = [];
+
+  const archived = filters.archived ?? "exclude";
+  if (archived === "exclude") conditions.push(isNull(orders.archivedAt));
+  if (archived === "only") conditions.push(isNotNull(orders.archivedAt));
+
+  if (filters.status && filters.status !== "all") {
+    conditions.push(eq(orders.status, filters.status));
+  }
+
+  if (filters.stage?.length) {
+    conditions.push(sql`${orderStageSql()} in (${sql.join(filters.stage.map((stage) => sql`${stage}`), sql`, `)})`);
+  }
+
+  if (filters.kind) {
+    conditions.push(eq(shipments.kind, filters.kind));
+  }
+
+  if (filters.orderType) {
+    conditions.push(eq(orders.orderType, filters.orderType));
+  }
+
+  if (filters.assigneeId !== undefined) {
+    conditions.push(filters.assigneeId === null ? isNull(orders.assigneeId) : eq(orders.assigneeId, filters.assigneeId));
+  }
+
+  const byCallback = filters.callback === "set";
+  if (byCallback) {
+    conditions.push(isNotNull(orders.callbackAt), inArray(orders.status, WAITING_STATUSES));
+  }
+
+  if (filters.teamQueue) {
+    conditions.push(inTeamQueue(filters.teamQueue));
+  }
+
+  if (filters.calls !== undefined) {
+    conditions.push(inCallList(filters.calls));
+  }
+
+  if (filters.attention !== undefined) {
+    conditions.push(filters.attention ? orderNeedsAttentionSql() : sql`not ${orderNeedsAttentionSql()}`);
+  }
+
+  if (filters.flagged) {
+    conditions.push(sql`EXISTS (SELECT 1 FROM order_attempts WHERE order_attempts.order_id = orders.id AND order_attempts.outcome = 'flagged')`);
+  }
+
+  if (filters.wilayaId) {
+    conditions.push(eq(orders.wilayaId, filters.wilayaId));
+  }
+
+  if (filters.channel?.length) {
+    const known = filters.channel.filter((channel): channel is OrderChannel => channel !== "unknown");
+    // As `orderAttributionView` reads a row: a source a merchant chose before v2 is the dashboard's, and an order with no channel is unknown.
+    const merchantChosen = and(isNull(orderAttribution.channel), eq(orderAttribution.method, "merchant"))!;
+    const parts = [
+      ...(known.length ? [inArray(orderAttribution.channel, known)] : []),
+      ...(known.includes("dashboard") ? [merchantChosen] : []),
+      ...(filters.channel.includes("unknown") ? [and(isNull(orderAttribution.channel), or(isNull(orderAttribution.method), ne(orderAttribution.method, "merchant")))!] : []),
+    ];
+    conditions.push(parts.length === 1 ? parts[0]! : or(...parts)!);
+  }
+
+  if (filters.search) {
+    const term = `%${safeLikeTerm(filters.search)}%`;
+    conditions.push(
+      or(
+        like(orders.orderNumber, term),
+        like(orders.customerName, term),
+        like(orders.phone, term),
+        like(shipments.trackingNumber, term),
+      ),
+    );
+  }
+
+  let offset = filters.offset ?? 0;
+  if (filters.cursor) {
+    const after = parseOrderCursor(filters.cursor);
+    if (after) {
+      conditions.push(
+        byCallback
+          ? sql`(orders.callback_at, orders.id) > (${after.createdAt}, ${after.id})`
+          : sql`(orders.created_at, orders.id) < (${after.createdAt}, ${after.id})`,
+      );
+      offset = 0;
+    }
+  }
+
+  const rows = await db
+    .select({
+      ...orderResponseColumns,
+      wilaya: wilayas.nameAr,
+      commune: communes.nameAr,
+      driverName: sql<
+        string | null
+      >`CASE WHEN ${driversAlias.firstName} IS NOT NULL THEN ${driversAlias.firstName} || ' ' || ${driversAlias.lastName} ELSE NULL END`,
+      assigneeName: sql<string | null>`(SELECT users.name FROM users WHERE users.id = orders.assignee_id)`,
+      hasReview: sql<number>`EXISTS (SELECT 1 FROM reviews WHERE reviews.order_id = orders.id)`,
+      flagged: sql<number>`EXISTS (SELECT 1 FROM order_attempts WHERE order_attempts.order_id = orders.id AND order_attempts.outcome = 'flagged')`,
+      shipmentId: sql<string | null>`${shipments.id}`,
+      shipmentKind: sql<ShipmentKind | null>`${shipments.kind}`,
+      carrierName: sql<string | null>`${deliveryCompanies.name}`,
+      trackingNumber: sql<string | null>`${shipments.trackingNumber}`,
+      stage: orderStageSql(),
+      needsAttention: orderNeedsAttentionSql(),
+      flagMatchesJson: sql<string | null>`(SELECT order_attempts.matches_json FROM order_attempts WHERE order_attempts.order_id = orders.id AND order_attempts.outcome = 'flagged' LIMIT 1)`,
+      sourceRow: {
+        orderId: orderAttribution.orderId,
+        method: orderAttribution.method,
+        channel: orderAttribution.channel,
+        platform: orderAttribution.platform,
+        siteSource: orderAttribution.siteSource,
+        clickId: orderAttribution.clickId,
+        clickIdType: orderAttribution.clickIdType,
+        utmSource: orderAttribution.utmSource,
+        utmMedium: orderAttribution.utmMedium,
+        utmCampaign: orderAttribution.utmCampaign,
+        utmTerm: orderAttribution.utmTerm,
+        utmContent: orderAttribution.utmContent,
+        namesJson: orderAttribution.namesJson,
+        referrerHost: orderAttribution.referrerHost,
+      },
+    })
+    .from(orders)
+    .leftJoin(wilayas, eq(orders.wilayaId, wilayas.id))
+    .leftJoin(communes, eq(orders.communeId, communes.id))
+    .leftJoin(shipments, eq(shipments.orderId, orders.id))
+    .leftJoin(driversAlias, eq(shipments.driverId, driversAlias.id))
+    .leftJoin(deliveryCompanies, eq(shipments.companyId, deliveryCompanies.id))
+    .leftJoin(orderAttribution, eq(orderAttribution.orderId, orders.id))
+    .where(conditions.length > 0 ? and(...conditions) : undefined)
+    .orderBy(...(byCallback ? [asc(orders.callbackAt), asc(orders.id)] : [desc(orders.createdAt), desc(orders.id)]))
+    .limit(filters.limit ?? 50)
+    .offset(offset)
+    .all();
+  return rows.map(({ flagMatchesJson, sourceRow, ...row }) => ({
+    ...row,
+    flagReasons: flagReasonsOf(flagMatchesJson),
+    /** Where the order came from (ADR 0026); null when it is not known. */
+    source: orderSourceSummary(sourceRow?.orderId ? sourceRow : null),
+  }));
+}
+
+/** The Active Flag rules that flagged an order: what its flag says when pointed at. */
+function flagReasonsOf(matchesJson: string | null): RuleMatch[] {
+  if (!matchesJson) return [];
+  try {
+    const matches: unknown = JSON.parse(matchesJson);
+    return Array.isArray(matches) ? (matches as RuleMatch[]).filter((match) => match?.mode === "active" && match.action === "flag") : [];
+  } catch {
+    return [];
+  }
+}
+
+/** `withCosts`: what each line cost the merchant, for a member who may see finance. */
+export async function getOrderById(db: AppDb, orderId: string, options: { withCosts?: boolean } = {}) {
+  const order = await db
+    .select({
+      ...orderResponseColumns,
+      wilaya: wilayas.nameAr,
+      commune: communes.nameAr,
+      driverName: sql<
+        string | null
+      >`CASE WHEN ${driversAlias.firstName} IS NOT NULL THEN ${driversAlias.firstName} || ' ' || ${driversAlias.lastName} ELSE NULL END`,
+      assigneeName: sql<string | null>`(SELECT users.name FROM users WHERE users.id = orders.assignee_id)`,
+      decidedByName: sql<string | null>`(SELECT users.name FROM users WHERE users.id = orders.decided_by)`,
+      confirmedByName: sql<string | null>`(SELECT users.name FROM users WHERE users.id = orders.confirmed_by)`,
+    })
+    .from(orders)
+    .leftJoin(wilayas, eq(orders.wilayaId, wilayas.id))
+    .leftJoin(communes, eq(orders.communeId, communes.id))
+    .leftJoin(shipments, eq(shipments.orderId, orders.id))
+    .leftJoin(driversAlias, eq(shipments.driverId, driversAlias.id))
+    .where(eq(orders.id, orderId))
+    .get();
+
+  if (!order) return null;
+
+  const processing = Object.keys(ORDER_STATUS_OF_EVENT) as OrderProcessingEvent[];
+  const [orderProductsList, timeline, attribution, handovers] = await db.batch([
+    db.select().from(orderProducts).where(eq(orderProducts.orderId, orderId)),
+    db
+      .select({ id: businessEvents.id, type: businessEvents.type, occurredAt: businessEvents.occurredAt, actorId: businessEvents.actorId, actorName: businessEvents.actorName })
+      .from(businessEvents)
+      .where(and(eq(businessEvents.orderId, orderId), inArray(businessEvents.type, processing)))
+      .orderBy(desc(businessEvents.seq)),
+    db.select().from(orderAttribution).where(eq(orderAttribution.orderId, orderId)),
+    db
+      .select({ id: businessEvents.id, type: businessEvents.type, occurredAt: businessEvents.occurredAt, actorName: businessEvents.actorName, data: businessEvents.data })
+      .from(businessEvents)
+      .where(and(eq(businessEvents.orderId, orderId), inArray(businessEvents.type, ["order.assigned", "order.unassigned"])))
+      .orderBy(desc(businessEvents.seq)),
+  ]);
+
+  return {
+    ...order,
+    /** What each line cost the merchant, only for a member who may see finance. */
+    products: orderProductsList.map(({ unitCost, unitCostSource, ...line }) => (options.withCosts ? { ...line, unitCost, unitCostSource } : line)),
+    /** Who the order was given to, newest first, as its Business Events recorded it. */
+    assignmentHistory: handovers.map((event) => assignmentStep(event)),
+    /** Where the order came from (ADR 0026); null when nothing is known. */
+    attribution: attribution[0] ? orderAttributionView(attribution[0]) : null,
+    /** The order's processing as its Business Events recorded it, newest first. */
+    statusHistory: timeline.map((event) => ({
+      id: event.id,
+      orderId,
+      status: ORDER_STATUS_OF_EVENT[event.type as OrderProcessingEvent],
+      timestamp: event.occurredAt,
+      by: event.actorId,
+      byName: event.actorName,
+    })),
+  };
+}
+
+type TeamMemberRef = { id: string; name: string } | null;
+
+/** One handover of an order, as its `order.assigned` or `order.unassigned` event says it. */
+function assignmentStep(event: { id: string; type: string; occurredAt: string; actorName: string | null; data: string }) {
+  const data = JSON.parse(event.data) as { assignee?: TeamMemberRef; previousAssignee?: TeamMemberRef; way?: AssignmentWay };
+  return {
+    id: event.id,
+    at: event.occurredAt,
+    to: event.type === "order.assigned" ? (data.assignee ?? null) : null,
+    from: data.previousAssignee ?? null,
+    way: event.type === "order.assigned" ? (data.way ?? "manual") : ("manual" as AssignmentWay),
+    byName: event.actorName,
+  };
+}
+
+/** A line of a new order: it always names the product it sells (only a removed product's old lines lose the link). */
+export type NewOrderLine = typeof orderProducts.$inferInsert & { productId: string };
+
+/**
+ * Create an order from the dashboard or an AI agent. Every order starts
+ * `new`: it moves on only through the lifecycle, so each later status has its
+ * Business Event. It is placed in the store's primary language; only a
+ * storefront checkout records the shopper's own, and its checkout key.
+ */
+export async function createOrder(
+  db: AppDb,
+  orderData: Omit<typeof orders.$inferInsert, "locale" | "checkoutKey" | "status">,
+  productsData: Array<NewOrderLine>,
+  author: Author,
+) {
+  const now = orderData.createdAt ?? new Date().toISOString();
+  const credit = creditOf(author.actor);
+
+  const primaryLanguage = sql<StoreLocale>`(select ${stores.lang} from ${stores} limit 1)`;
+  const assignment = assignmentOnCreate(author, now);
+  const statements: BatchStatement[] = [
+    db.insert(orders).values({ ...orderData, status: "new", locale: primaryLanguage, ...assignment }),
+  ];
+
+  if (productsData.length > 0) {
+    statements.push(db.insert(orderProducts).values(productsData));
+  }
+
+  const entered = enteredAttributionRow(orderData.id!, author.origin, now);
+  if (entered) statements.push(db.insert(orderAttribution).values(entered));
+
+  for (const item of productsData) {
+    const qty = item.quantity as number;
+
+    const productRow = await db
+      .select({ trackInventory: products.trackInventory })
+      .from(products)
+      .where(eq(products.id, item.productId))
+      .get();
+
+    if (!productRow?.trackInventory) continue;
+
+    // Guarded deduction, same pattern as the storefront path: the movement's
+    // qtyBefore/qtyAfter are subselects guarded by inventory >= qty. When
+    // stock is insufficient (or a concurrent writer already took it), the
+    // subselects return NULL, the movement insert violates NOT NULL, and the
+    // ENTIRE batch rolls back — no oversell floor, no lost-update race.
+    if (item.variantId) {
+      statements.push(
+        db.insert(stockMovements).values({
+          id: crypto.randomUUID(),
+          productId: item.productId,
+          variantId: item.variantId,
+          type: "ORDER_DEDUCTED",
+          delta: -qty,
+          qtyBefore: sql`(SELECT inventory FROM product_variants WHERE id = ${item.variantId} AND inventory >= ${qty})`,
+          qtyAfter: sql`(SELECT inventory - ${qty} FROM product_variants WHERE id = ${item.variantId} AND inventory >= ${qty})`,
+          reason: null,
+          reference: orderData.id ?? null,
+          createdBy: credit.id,
+          createdByName: credit.name,
+          createdAt: now,
+        }),
+      );
+      statements.push(
+        db
+          .update(productVariants)
+          .set({
+            inventory: sql`${productVariants.inventory} - ${qty}`,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(productVariants.id, item.variantId),
+              sql`${productVariants.inventory} >= ${qty}`,
+            ),
+          ),
+      );
+    } else {
+      statements.push(
+        db.insert(stockMovements).values({
+          id: crypto.randomUUID(),
+          productId: item.productId,
+          variantId: null,
+          type: "ORDER_DEDUCTED",
+          delta: -qty,
+          qtyBefore: sql`(SELECT inventory FROM products WHERE id = ${item.productId} AND inventory >= ${qty})`,
+          qtyAfter: sql`(SELECT inventory - ${qty} FROM products WHERE id = ${item.productId} AND inventory >= ${qty})`,
+          reason: null,
+          reference: orderData.id ?? null,
+          createdBy: credit.id,
+          createdByName: credit.name,
+          createdAt: now,
+        }),
+      );
+      statements.push(
+        db
+          .update(products)
+          .set({
+            inventory: sql`${products.inventory} - ${qty}`,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(products.id, item.productId),
+              sql`${products.inventory} >= ${qty}`,
+            ),
+          ),
+      );
+    }
+  }
+
+  statements.push(
+    recordEvent(db, { type: "order.created", subjectId: orderData.id!, orderId: orderData.id!, occurredAt: now, ...author, data: { order: orderSnapshot(orderData.id!) } }),
+    assignedOnCreate(db, orderData.id!, now, author),
+  );
+
+  // Atomic: order row, lines, history, customer stats, stock deduction,
+  // ledger and the order.created event commit together or not at all. Guarded deductions make the batch
+  // fail (and roll back entirely) when stock is insufficient — no silent
+  // floor-at-zero, no lost-update races. A taken order number rolls it back
+  // the same way, so the order row is drawn again and the batch retried.
+  let orderNumber = orderData.orderNumber;
+  for (let attempt = 1; ; attempt += 1) {
+    statements[0] = db.insert(orders).values({ ...orderData, orderNumber, locale: primaryLanguage, ...assignment });
+    try {
+      await db.batch(statements as [BatchStatement, ...BatchStatement[]]);
+      break;
+    } catch (error) {
+      if (attempt >= MAX_ORDER_NUMBER_DRAWS || !isOrderNumberCollision(error)) throw error;
+      orderNumber = drawOrderNumber(now);
+    }
+  }
+
+  return { id: orderData.id, orderNumber };
+}
+
+export type StatusChange = { ok: true } | { ok: false; reason: "not_found" | "has_shipment" | "changed" };
+
+/**
+ * What a status change tells about who handled the order, kept on it: its
+ * first move away from `new` and its first confirmation, each with the member
+ * behind it (null for the system); each move to `unreachable` is one more
+ * call without an answer; a callback ends once the order is confirmed or
+ * cancelled. Read from the row as it was before the change.
+ */
+function handlingOf(newStatus: OrderStatus, author: Author, now: string) {
+  const member = staffOf(author.actor)?.id ?? null;
+  return {
+    decidedAt: sql`case when ${orders.status} = 'new' then ${now} else ${orders.decidedAt} end`,
+    decidedBy: sql`case when ${orders.status} = 'new' then ${member} else ${orders.decidedBy} end`,
+    ...(newStatus === "confirmed"
+      ? { confirmedAt: sql`coalesce(${orders.confirmedAt}, ${now})`, confirmedBy: sql`case when ${orders.confirmedAt} is null then ${member} else ${orders.confirmedBy} end` }
+      : {}),
+    ...(newStatus === "unreachable" ? { unansweredCalls: sql`${orders.unansweredCalls} + 1` } : {}),
+    ...(newStatus === "confirmed" || newStatus === "cancelled" ? { callbackAt: null } : {}),
+  };
+}
+
+/**
+ * Move an order to a new status, with its effects: its Business Event, and on cancel the
+ * goods restocked. (Delivery and return
+ * are the shipment's milestones, with their own effects — record-events.ts.)
+ *
+ * Exactly once, in one batch: the order takes the new status, with a fresh
+ * revision, only while it still has the status it was read with and has no
+ * shipment — the statements of one batch run as one transaction, so that
+ * check holds for the whole batch — and every other statement applies only
+ * while that revision stands. Two cancels at once apply their effects once;
+ * a cancel racing a handoff loses to it (an order with a shipment has no
+ * status change). With `seen`, it applies only while the order still is as
+ * its author saw it: a call without an answer is counted once, and a move on
+ * an order someone else confirmed or cancelled meanwhile is refused.
+ */
+export async function updateOrderStatus(
+  db: AppDb,
+  orderId: string,
+  newStatus: OrderStatus,
+  author: Author,
+  seen?: SeenOrder,
+): Promise<StatusChange> {
+  if (newStatus === "new") throw new Error("An order never moves back to new: the lifecycle has no such transition");
+  const now = new Date().toISOString();
+
+  const order = await db.select().from(orders).where(eq(orders.id, orderId)).get();
+  if (!order) return { ok: false, reason: "not_found" };
+  if (statusMovedOn(order, seen)) return { ok: false, reason: "changed" };
+
+  const revision = crypto.randomUUID();
+  const claimed = sql`exists (select 1 from ${orders} where ${orders.id} = ${orderId} and ${orders.revision} = ${revision})`;
+
+  const statements: BatchStatement[] = [
+    db
+      .update(orders)
+      .set({ status: newStatus, revision, updatedAt: now, ...handlingOf(newStatus, author, now) })
+      .where(
+        and(
+          eq(orders.id, orderId),
+          eq(orders.status, order.status),
+          seen === undefined ? undefined : eq(orders.unansweredCalls, seen.unansweredCalls),
+          sql`not exists (select 1 from ${shipments} where ${shipments.orderId} = ${orderId})`,
+        ),
+      ),
+  ];
+
+  if (newStatus === "cancelled" && order.status !== "cancelled") {
+    const lines = await linesToRestock(db, orderId);
+    statements.push(
+      ...restockStatements(
+        db,
+        lines,
+        "ORDER_CANCELLED",
+        orderId,
+        creditOf(author.actor),
+        now,
+        claimed,
+      ),
+    );
+  }
+
+  statements.push(
+    recordEvent(
+      db,
+      { type: ORDER_STATUS_EVENT[newStatus], subjectId: orderId, orderId, occurredAt: now, ...author, data: { order: orderSnapshot(orderId), previousStatus: order.status } },
+      claimed,
+    ),
+  );
+
+  // Atomic: a mid-sequence failure leaves no partial state, so a retry is safe.
+  const [claim] = await db.batch(statements as [BatchStatement, ...BatchStatement[]]);
+  if (((claim as { meta?: { changes?: number } }).meta?.changes ?? 0) > 0) return { ok: true };
+  const shipment = await db.select({ id: shipments.id }).from(shipments).where(eq(shipments.orderId, orderId)).get();
+  return { ok: false, reason: shipment ? "has_shipment" : "changed" };
+}
+
+export interface UpdateOrderData {
+  customerName?: string;
+  phone?: string;
+  /** null clears the email; undefined leaves it untouched. */
+  customerEmail?: string | null;
+  wilayaId?: number;
+  communeId?: string;
+  city?: string | null;
+  /** null clears the address; undefined leaves it untouched. */
+  address?: string | null;
+  deliveryType?: "home" | "stop_desk";
+  notes?: string | null;
+}
+
+/**
+ * Partial edit of an order's customer/destination fields. Identity (id,
+ * orderNumber), pricing, and dispatch state are deliberately not patchable —
+ * pricing is fixed at creation. Once the order has a shipment its delivery
+ * details are refused here (`has_shipment`): the parcel carries them, so they
+ * change through the shipment, which edits the carrier first and then calls
+ * this with `throughShipment`.
+ *
+ * The linked customer record is kept in sync in the same operation: name,
+ * phone, wilaya/commune, and address edits flow into `customers`, so an order
+ * and its customer never disagree on who they belong to (phone is the
+ * customer identity). Only fields this edit actually changes are written.
+ * When the corrected phone already belongs to a different customer record,
+ * the order is re-pointed to that record instead of hijacking its phone.
+ * customerEmail is order-only — customers have no email column.
+ */
+/** The delivery details a shipment carries: once an order has one, they change only through it. */
+export const DELIVERY_DETAIL_FIELDS = ["customerName", "phone", "wilayaId", "communeId", "city", "address", "deliveryType"] as const satisfies ReadonlyArray<keyof UpdateOrderData>;
+
+export type OrderEdit = { ok: true } | { ok: false; reason: "not_found" | "has_shipment" };
+
+export async function updateOrder(
+  db: AppDb,
+  orderId: string,
+  updates: UpdateOrderData,
+  author: Author,
+  options: { throughShipment?: boolean } = {},
+): Promise<OrderEdit> {
+  const current = await db
+    .select({
+      customerId: orders.customerId,
+      customerName: orders.customerName,
+      phone: orders.phone,
+      customerEmail: orders.customerEmail,
+      wilayaId: orders.wilayaId,
+      communeId: orders.communeId,
+      city: orders.city,
+      address: orders.address,
+      deliveryType: orders.deliveryType,
+      notes: orders.notes,
+    })
+    .from(orders)
+    .where(eq(orders.id, orderId))
+    .get();
+
+  const patch: Record<string, unknown> = {
+    updatedAt: new Date().toISOString(),
+  };
+  if (updates.customerName !== undefined) patch.customerName = updates.customerName;
+  if (updates.phone !== undefined) patch.phone = updates.phone;
+  if (updates.customerEmail !== undefined) patch.customerEmail = updates.customerEmail;
+  if (updates.wilayaId !== undefined) patch.wilayaId = updates.wilayaId;
+  if (updates.communeId !== undefined) patch.communeId = updates.communeId;
+  if (updates.city !== undefined) patch.city = updates.city;
+  if (updates.address !== undefined) patch.address = updates.address;
+  if (updates.deliveryType !== undefined) patch.deliveryType = updates.deliveryType;
+  if (updates.notes !== undefined) patch.notes = updates.notes;
+
+  const customerUpdates: UpdateCustomerData = {};
+  if (current) {
+    if (updates.customerName !== undefined && updates.customerName !== current.customerName) {
+      customerUpdates.name = updates.customerName;
+    }
+    if (updates.wilayaId !== undefined && updates.wilayaId !== current.wilayaId) {
+      customerUpdates.wilayaId = updates.wilayaId;
+    }
+    if (updates.communeId !== undefined && updates.communeId !== current.communeId) {
+      customerUpdates.communeId = updates.communeId;
+    }
+    if (updates.address !== undefined && (updates.address ?? null) !== (current.address ?? null)) {
+      customerUpdates.address = updates.address ?? null;
+    }
+
+    if (updates.phone !== undefined && updates.phone !== current.phone) {
+      const phoneOwner = await getCustomerByPhone(db, updates.phone);
+      if (phoneOwner && phoneOwner.id !== current.customerId) {
+        // The corrected number already identifies another customer record —
+        // move the order to it. Only fields this edit changed flow onto it,
+        // never the previous customer's identity.
+        patch.customerId = phoneOwner.id;
+      } else {
+        customerUpdates.phone = updates.phone;
+      }
+    }
+  }
+
+  if (!current) return { ok: false, reason: "not_found" };
+
+  // Atomic with the handoff: a reservation and this edit can never both win.
+  const touchesDelivery = DELIVERY_DETAIL_FIELDS.some((field) => updates[field] !== undefined);
+  const locked = touchesDelivery && !options.throughShipment;
+  const changedFields = orderFieldsChanged(current, updates);
+  const now = patch.updatedAt as string;
+  const [result] = await db.batch([
+    db
+      .update(orders)
+      .set(patch)
+      .where(
+        locked
+          ? and(eq(orders.id, orderId), sql`not exists (select 1 from ${shipments} where ${shipments.orderId} = ${orderId})`)
+          : eq(orders.id, orderId),
+      ),
+    // Recorded only when the edit just before it applied (`changes()` is its
+    // count), with the order as the edit left it; an edit that changes
+    // nothing records nothing.
+    ...(changedFields.length
+      ? [recordEvent(db, { type: "order.updated", subjectId: orderId, orderId, occurredAt: now, ...author, data: { order: orderSnapshot(orderId), changedFields } }, sql`changes() > 0`)]
+      : []),
+  ]);
+  if (((result as { meta?: { changes?: number } }).meta?.changes ?? 0) === 0) return { ok: false, reason: "has_shipment" };
+
+  const customerTarget = (patch.customerId as string | undefined) ?? current?.customerId;
+  if (customerTarget && Object.keys(customerUpdates).length > 0) {
+    await updateCustomer(db, customerTarget, customerUpdates);
+  }
+  return { ok: true };
+}
+
+/** The parts of the order this edit changes, as `order.updated` names them. */
+function orderFieldsChanged(
+  current: { customerName: string; phone: string; customerEmail: string | null; wilayaId: number | null; communeId: string | null; city: string | null; address: string | null; deliveryType: "home" | "stop_desk"; notes: string | null },
+  updates: UpdateOrderData,
+): OrderField[] {
+  const differs = <K extends keyof UpdateOrderData & keyof typeof current>(key: K) =>
+    updates[key] !== undefined && (updates[key] ?? null) !== (current[key] ?? null);
+  const changed: OrderField[] = [];
+  if (differs("customerName")) changed.push("customerName");
+  if (differs("phone")) changed.push("customerPhone");
+  if (differs("customerEmail")) changed.push("customerEmail");
+  if (differs("wilayaId") || differs("communeId") || differs("city") || differs("address") || differs("deliveryType")) changed.push("destination");
+  if (differs("notes")) changed.push("notes");
+  return changed;
+}
+
+export type LineReturn =
+  | { ok: true; id: string; status: "fulfilled" | "partially_returned" | "returned"; returnedQuantity: number; quantity: number }
+  | { ok: false; reason: "line_not_found" | "out_of_range" | "order_closed" | "not_delivered" | "changed"; quantity?: number };
+
+/**
+ * Record how many units of one order line the customer refused at the door,
+ * putting the difference back in stock (or taking it out again when a return
+ * is corrected down).
+ *
+ * Refused once the order is cancelled or its shipment came back: those
+ * already put every remaining unit back. One batch, applied only while the
+ * line still has the returned quantity it was read with and the order is
+ * still open — so a cancel, a return of the whole parcel, or the same line
+ * return sent twice can never move the same units twice.
+ */
+export async function setOrderProductReturn(
+  db: AppDb,
+  orderId: string,
+  productLineId: string,
+  newReturnedQty: number,
+  author: Author,
+): Promise<LineReturn> {
+  const now = new Date().toISOString();
+  const line = await db
+    .select({ line: orderProducts, trackInventory: products.trackInventory })
+    .from(orderProducts)
+    .leftJoin(products, eq(products.id, orderProducts.productId))
+    .where(and(eq(orderProducts.id, productLineId), eq(orderProducts.orderId, orderId)))
+    .get();
+  if (!line) return { ok: false, reason: "line_not_found" };
+  const { quantity } = line.line;
+  if (newReturnedQty < 0 || newReturnedQty > quantity) return { ok: false, reason: "out_of_range", quantity };
+
+  const before = line.line.returnedQuantity ?? 0;
+  const delta = newReturnedQty - before;
+  const status: "fulfilled" | "partially_returned" | "returned" =
+    newReturnedQty === 0 ? "fulfilled" : newReturnedQty === quantity ? "returned" : "partially_returned";
+
+  const orderOpen = sql`exists (select 1 from ${orders} where ${orders.id} = ${orderId} and ${orders.status} <> 'cancelled')
+    and not exists (select 1 from ${shipments} where ${shipments.orderId} = ${orderId} and ${shipments.returnedAt} is not null)`;
+  // Units are refused at the door: the customer received the parcel and kept part of it.
+  const delivered = sql`exists (select 1 from ${shipments} where ${shipments.orderId} = ${orderId} and ${shipments.deliveredAt} is not null)`;
+  const applies = and(
+    sql`exists (select 1 from ${orderProducts} where ${orderProducts.id} = ${productLineId} and coalesce(${orderProducts.returnedQuantity}, 0) = ${before})`,
+    orderOpen,
+    delivered,
+  )!;
+
+  const statements: BatchStatement[] = [];
+  // A removed product has no stock to move: the refusal is still recorded on the line.
+  const { productId, variantId } = line.line;
+  if (delta !== 0 && line.trackInventory && productId) {
+    const stock = variantId
+      ? sql`(select ${productVariants.inventory} from ${productVariants} where ${productVariants.id} = ${variantId})`
+      : sql`(select ${products.inventory} from ${products} where ${products.id} = ${productId})`;
+    statements.push(
+      db.insert(stockMovements).select(
+        db
+          .select({
+            id: sql`${crypto.randomUUID()}`.as("id"),
+            productId: sql`${productId}`.as("product_id"),
+            variantId: sql`${variantId}`.as("variant_id"),
+            type: sql`'ORDER_RETURNED'`.as("type"),
+            delta: sql`${delta}`.as("delta"),
+            qtyBefore: sql`${stock}`.as("qty_before"),
+            qtyAfter: sql`max(0, ${stock} + ${delta})`.as("qty_after"),
+            reason: sql`null`.as("reason"),
+            reference: sql`${orderId}`.as("reference"),
+            createdBy: sql`${creditOf(author.actor).id}`.as("created_by"),
+            createdByName: sql`${creditOf(author.actor).name}`.as("created_by_name"),
+            createdAt: sql`${now}`.as("created_at"),
+          })
+          .from(sql`(select 1)`)
+          .where(applies),
+      ),
+      variantId
+        ? db
+            .update(productVariants)
+            .set({ inventory: sql`max(0, ${productVariants.inventory} + ${delta})`, updatedAt: now })
+            .where(and(eq(productVariants.id, variantId), applies))
+        : db
+            .update(products)
+            .set({ inventory: sql`max(0, ${products.inventory} + ${delta})`, updatedAt: now })
+            .where(and(eq(products.id, productId), applies)),
+    );
+  }
+  statements.push(
+    db
+      .update(orderProducts)
+      .set({ status, returnedQuantity: newReturnedQty })
+      .where(and(eq(orderProducts.id, productLineId), applies)),
+  );
+  const lineUpdate = statements.length - 1;
+  // Recorded only when the line update just before it applied (`changes()`
+  // is that statement's count), and after it, so the order reads as returned.
+  if (delta !== 0) {
+    statements.push(
+      recordEvent(
+        db,
+        { type: "order.line_returned", subjectId: orderId, orderId, occurredAt: now, ...author, data: { order: orderSnapshot(orderId), lineId: productLineId, previousReturnedQuantity: before } },
+        sql`changes() > 0`,
+      ),
+    );
+  }
+
+  const results = await db.batch(statements as [BatchStatement, ...BatchStatement[]]);
+  if (((results[lineUpdate] as { meta?: { changes?: number } }).meta?.changes ?? 0) > 0) {
+    return { ok: true, id: productLineId, status, returnedQuantity: newReturnedQty, quantity };
+  }
+  const state = await db
+    .select({ open: sql<number>`${orderOpen}`, delivered: sql<number>`${delivered}` })
+    .from(orders)
+    .where(eq(orders.id, orderId))
+    .get();
+  if (!state || !Number(state.open)) return { ok: false, reason: "order_closed" };
+  return { ok: false, reason: Number(state.delivered) ? "changed" : "not_delivered" };
+}
+
+export type OrderDeletion = { ok: true } | { ok: false; reason: "not_found" | "has_shipment" | "changed" };
+
+const DELETE_ATTEMPTS = 3;
+
+/** A finished order: cancelled, or its shipment closed (delivered, returned, or cancelled at the carrier). */
+const orderFinishedSql = sql`(orders.status = 'cancelled' or exists (select 1 from shipments s where s.order_id = orders.id and (s.delivered_at is not null or s.returned_at is not null or s.cancelled_at is not null)))`;
+
+/**
+ * Delete an order and undo what it did: the customer's order count and spend,
+ * and the goods still out of stock (a line whose product was removed has
+ * nothing to go back to). Its lines, history, reviews and logs go with it.
+ *
+ * Only an order never handed to delivery: once it has a shipment, the parcel,
+ * the driver's cash and the carrier's records rest on it, and a finished one
+ * is archived instead. The database refuses it too (migration 0042), so no
+ * other path can remove it.
+ *
+ * One batch, applied only while the order is as it was read and still has no
+ * shipment (the statements of a batch run as one transaction); if it changed
+ * meanwhile, the deletion is planned again.
+ */
+export async function deleteOrder(db: AppDb, orderId: string, author: Author): Promise<OrderDeletion> {
+  for (let attempt = 1; attempt <= DELETE_ATTEMPTS; attempt++) {
+    const outcome = await attemptDelete(db, orderId, author);
+    if (outcome.ok || outcome.reason !== "changed") return outcome;
+  }
+  return { ok: false, reason: "changed" };
+}
+
+async function attemptDelete(db: AppDb, orderId: string, author: Author): Promise<OrderDeletion> {
+  const now = new Date().toISOString();
+  const [order, shipment] = await db.batch([
+    db.select().from(orders).where(eq(orders.id, orderId)),
+    db.select({ id: shipments.id }).from(shipments).where(eq(shipments.orderId, orderId)),
+  ]);
+  if (!order[0]) return { ok: false, reason: "not_found" };
+  if (shipment[0]) return { ok: false, reason: "has_shipment" };
+  const read = order[0];
+
+  const asRead = and(
+    sql`exists (select 1 from ${orders} where ${orders.id} = ${orderId} and ${orders.status} = ${read.status} and ${orders.updatedAt} = ${read.updatedAt})`,
+    sql`not exists (select 1 from ${shipments} where ${shipments.orderId} = ${orderId})`,
+  )!;
+
+  // The event first: its snapshot is the order as it was, before anything is undone.
+  const statements: BatchStatement[] = [
+    recordEvent(db, { type: "order.deleted", subjectId: orderId, orderId, occurredAt: now, ...author, data: { order: orderSnapshot(orderId) } }, asRead),
+  ];
+  const lines = await linesToRestock(db, orderId);
+  statements.push(...restockStatements(db, lines, "ORDER_CANCELLED", orderId, creditOf(author.actor), now, asRead, "Order deleted - inventory restored"));
+  statements.push(db.delete(orders).where(and(eq(orders.id, orderId), asRead)));
+
+  const results = await db.batch(statements as [BatchStatement, ...BatchStatement[]]);
+  const deleted = ((results.at(-1) as { meta?: { changes?: number } }).meta?.changes ?? 0) > 0;
+  return deleted ? { ok: true } : { ok: false, reason: "changed" };
+}
+
+export type OrderArchiving =
+  | { ok: true; archivedAt: string | null }
+  | { ok: false; reason: "not_found" | "not_finished" };
+
+/**
+ * Archive a finished order: it leaves the working lists and their counts and
+ * still counts everywhere else. Archiving one already archived keeps the
+ * first date.
+ */
+export async function archiveOrder(db: AppDb, orderId: string): Promise<OrderArchiving> {
+  const now = new Date().toISOString();
+  const archived = await db
+    .update(orders)
+    .set({ archivedAt: sql`coalesce(${orders.archivedAt}, ${now})` })
+    .where(and(eq(orders.id, orderId), orderFinishedSql))
+    .returning({ archivedAt: orders.archivedAt });
+  if (archived[0]) return { ok: true, archivedAt: archived[0].archivedAt };
+  const exists = await db.select({ id: orders.id }).from(orders).where(eq(orders.id, orderId)).get();
+  return { ok: false, reason: exists ? "not_finished" : "not_found" };
+}
+
+/** Bring an archived order back to the working lists. */
+export async function unarchiveOrder(db: AppDb, orderId: string): Promise<OrderArchiving> {
+  const restored = await db.update(orders).set({ archivedAt: null }).where(eq(orders.id, orderId)).returning({ archivedAt: orders.archivedAt });
+  return restored[0] ? { ok: true, archivedAt: null } : { ok: false, reason: "not_found" };
+}
+
+/** What can be done to an order to clear it away, and what deleting it would undo. */
+export interface OrderRemoval {
+  id: string;
+  orderNumber: string;
+  /** None yet; one on its way; or one that ended. */
+  shipment: "none" | "open" | "closed";
+  /** Only before handoff. */
+  deletable: boolean;
+  /** Only once finished, and not archived yet. */
+  archivable: boolean;
+  archivedAt: string | null;
+  lines: number;
+  /** Units deleting it puts back in stock. */
+  restockUnits: number;
+  reviews: number;
+}
+
+/** What `deleteOrder` / `archiveOrder` would do for this order, read in one statement. Null when it does not exist. */
+export async function orderRemoval(db: AppDb, orderId: string): Promise<OrderRemoval | null> {
+  const row = await db.get<{
+    id: string;
+    orderNumber: string;
+    archivedAt: string | null;
+    status: string;
+    shipmentId: string | null;
+    shipmentClosed: number | null;
+    lines: number;
+    reviews: number;
+    restockUnits: number;
+  }>(sql`
+    select o.id as id, o.order_number as orderNumber, o.archived_at as archivedAt, o.status as status,
+      s.id as shipmentId,
+      (s.delivered_at is not null or s.returned_at is not null or s.cancelled_at is not null) as shipmentClosed,
+      (select count(*) from order_products op where op.order_id = o.id) as lines,
+      (select count(*) from reviews r where r.order_id = o.id) as reviews,
+      (select coalesce(sum(op.quantity - op.returned_quantity), 0) from order_products op join products p on p.id = op.product_id
+        where op.order_id = o.id and p.track_inventory = 1) as restockUnits
+    from orders o left join shipments s on s.order_id = o.id
+    where o.id = ${orderId}`);
+  if (!row) return null;
+  const shipment = !row.shipmentId ? "none" : row.shipmentClosed ? "closed" : "open";
+  const finished = row.status === "cancelled" || shipment === "closed";
+  return {
+    id: row.id,
+    orderNumber: row.orderNumber,
+    shipment,
+    deletable: shipment === "none",
+    archivable: !row.archivedAt && finished,
+    archivedAt: row.archivedAt,
+    lines: Number(row.lines),
+    restockUnits: shipment === "none" ? Number(row.restockUnits) : 0,
+    reviews: Number(row.reviews),
+  };
+}

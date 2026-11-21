@@ -1,0 +1,63 @@
+# Stores Management API (Merchant)
+
+Private management API for configuring store-wide settings, branding and localization. This endpoint is used by the merchant/admin to control the look and feel of the storefront.
+
+Not to be confused with `/api/store/*` — the public storefront API.
+
+## Structure
+
+```
+stores/
+├── routes.ts       # OpenAPIHono route definitions (validation + spec), admin-only
+├── handlers.ts     # HTTP request handlers (controller logic)
+├── queries.ts      # Re-exports shared store queries
+├── validation.ts   # Zod validation schemas (handler-level fallback)
+├── stores.test.ts  # Unit tests for query logic and error classes
+├── routes.test.ts  # Route-level integration tests (OpenAPIHono router)
+└── README.md       # This file
+```
+
+Routes are defined with `@hono/zod-openapi` (`createRoute`), making `routes.ts`
+the single source of truth for request validation and the OpenAPI spec.
+Handlers read pre-validated data via `(c.req as any).valid?.(...)` and fall
+back to the Zod schemas in `validation.ts` when mounted standalone.
+
+## API Endpoints
+
+### GET /api/stores/me
+Retrieve the current store's configuration. In this single-tenant architecture, this returns the primary store record from the database.
+
+**Authorization:** Admin role required (`requireAdmin()`)
+
+**Response Includes:**
+- **Identity:** `name`, `domain`, `logoUrl`.
+- **Theme:** `themeId` (active theme slug).
+- **Localization:** `lang` (primary language), `languages` — every language the store has added, primary first: `[{ "locale": "fr", "published": true, "primary": true }, …]` — `currency`, `currencySymbol`.
+- **SEO:** `metaTitle`, `metaDescription`, `ogImage`.
+- **Not here:** the review rules are the Reviews App's (`GET/PUT /api/apps/reviews`). A store has no status setting: nothing ever read it, so it is neither shown nor taken (the column stays for `/store/config`).
+- **Storefront key:** `storeApiKey` (plaintext; visible to the merchant in settings).
+
+### PATCH /api/stores/me
+Update store configuration. Partial updates are supported; set nullable fields to `null` to clear them.
+
+**Authorization:** Admin role required (`requireAdmin()`)
+
+**Request Body (Partial):**
+```json
+{
+  "name": "My New Store Name",
+  "metaTitle": "My New Store — Algiers"
+}
+```
+
+Field rules: `lang` takes `"ar"`, `"fr"` or `"en"` — set alone, it also adds and publishes that language; `languages` (`[{ "locale", "published" }]`) replaces the store's list, must publish the primary (the new one when `lang` changes in the same save), and removing a language removes its theme text edits (those edits are written by Wocart Cloud's visual editor, not by this API); URLs are validated; `metaTitle` ≤ 200, `metaDescription` ≤ 500 chars. Colors, the font and an announcement bar are not store fields: they are a theme's settings (migrations 0047, 0048).
+
+The Meta pixel and conversions setup is no longer a store route: it is the
+Meta App, `GET` / `PUT` / `DELETE /api/apps/meta` (`src/endpoints/apps/`), like
+the store's other Apps (`cod-shared/apps/CONTEXT.md`).
+
+## Implementation Details
+
+- **Single-Tenant Guard:** The `queries.ts` is optimized to fetch the first and only store record in the D1 database, ensuring simplicity and performance for single-tenant deployments.
+- **Visual Customization:** Supports full hex color validation (3-8 characters including alpha channel) to allow for advanced theme customization.
+- **SEO Ready:** Provides fields for Open Graph images and Meta tags that are consumed directly by the public storefront SSR.

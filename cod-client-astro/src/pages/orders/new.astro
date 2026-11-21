@@ -1,0 +1,13 @@
+---
+import DashboardLayout from "@/layouts/DashboardLayout.astro";
+import { PageSkeleton } from "@/components/layout/PageSkeleton";
+import NewOrderPageApp from "@/features/orders/components/NewOrderPageApp";
+---
+
+<DashboardLayout>
+  <PageSkeleton gate="required" />
+
+  <div data-auth-gate="required" hidden>
+    <NewOrderPageApp client:only="react" />
+  </div>
+</DashboardLayout>

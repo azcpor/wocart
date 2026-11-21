@@ -1,0 +1,56 @@
+{
+  "title": "Translations",
+  "subtitle": "This text in your store's other languages. Untranslated fields show in your default language.",
+  "languages_label": "Languages",
+  "no_languages": "Your store has one language. Add another in Settings → Languages to translate this.",
+  "draft": "Not published",
+  "outdated": "Outdated",
+  "source_empty": "(empty in your default language: nothing to translate)",
+  "save": "Save translation",
+  "saving": "Saving…",
+  "saved": "Translation saved",
+  "save_error": "Couldn't save the translation",
+  "error_load": "Couldn't load translations",
+  "options_title": "Variant options",
+  "options_hint": "Shoppers choose these on the product page. Each value must read differently from the others.",
+  "option_name": "Option name",
+  "fields": {
+    "product": {
+      "name": "Name",
+      "description": "Description",
+      "metaTitle": "SEO title",
+      "metaDescription": "SEO description"
+    },
+    "category": {
+      "name": "Name",
+      "description": "Description",
+      "metaTitle": "SEO title",
+      "metaDescription": "SEO description"
+    },
+    "offer": {
+      "name": "Offer name"
+    },
+    "store": {
+      "metaTitle": "SEO title",
+      "metaDescription": "SEO description",
+      "currencySymbol": "Currency symbol"
+    },
+    "menuItem": {
+      "label": "Label"
+    },
+    "collection": {
+      "title": "Name",
+      "description": "Description"
+    },
+    "whatsappWidget": {
+      "caption": "Status caption",
+      "welcomeMessage": "Welcome message",
+      "launcherLabel": "Launcher button label",
+      "ctaLabel": "Chat button label",
+      "prefillGeneral": "Default message",
+      "prefillProduct": "Product page message",
+      "thankYouButtonLabel": "Thank-you page button label",
+      "prefillThankYou": "Thank-you page message"
+    }
+  }
+}

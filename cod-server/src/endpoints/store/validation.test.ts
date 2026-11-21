@@ -1,0 +1,159 @@
+import { describe, it, expect } from "vitest";
+import { storeOrderSchema } from "./validation";
+
+function orderWith(phone: string) {
+  return {
+    customerName: "Karim Benali",
+    phone,
+    wilayaId: 16,
+    communeId: "c-16-001",
+    productId: "prod-1",
+    productName: "T-shirt",
+    quantity: 1,
+    pricePerUnit: 2500,
+  };
+}
+
+describe("storeOrderSchema phone", () => {
+  it("accepts a local mobile and normalizes E.164/international forms to local", () => {
+    expect(storeOrderSchema.parse(orderWith("0551234567")).phone).toBe("0551234567");
+    expect(storeOrderSchema.parse(orderWith("+213 551 234 567")).phone).toBe("0551234567");
+    expect(storeOrderSchema.parse(orderWith("00213551234567")).phone).toBe("0551234567");
+  });
+
+  it("rejects non-Algerian-mobile phones with the Arabic error message", () => {
+    const result = storeOrderSchema.safeParse(orderWith("123456"));
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0].message).toContain("05");
+    }
+  });
+
+  it("rejects landlines and foreign numbers", () => {
+    expect(storeOrderSchema.safeParse(orderWith("041123456")).success).toBe(false);
+    expect(storeOrderSchema.safeParse(orderWith("+33123456789")).success).toBe(false);
+  });
+});
+
+/**
+ * A basket has no single representative product.
+ *
+ * `productId`, `productName` and `pricePerUnit` describe the one product a
+ * direct order form was rendered for. When the request carries `items[]` those
+ * three say nothing true — `normalizeOrderLines` ignores them outright — so a
+ * checkout page built from the cart has nothing honest to put in them.
+ * They stay required for every other shape, because a request with neither a
+ * basket nor a product is not an order.
+ */
+describe("storeOrderSchema — basket orders", () => {
+  const customer = {
+    customerName: "Karim Benali",
+    phone: "0551234567",
+    wilayaId: 16,
+    communeId: "c-16-001",
+  };
+  const basket = [
+    { productId: "prod-1", productName: "T-shirt", quantity: 2 },
+    { productId: "prod-2", productName: "Hoodie", quantity: 1, pricePerUnit: 4200 },
+  ];
+
+  it("accepts a basket with no top-level product", () => {
+    const result = storeOrderSchema.safeParse({ ...customer, items: basket });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.items).toHaveLength(2);
+      expect(result.data.productId).toBeUndefined();
+      expect(result.data.pricePerUnit).toBeUndefined();
+    }
+  });
+
+  it("still accepts a single-product order exactly as before", () => {
+    const result = storeOrderSchema.safeParse({
+      ...customer,
+      productId: "prod-1",
+      productName: "T-shirt",
+      quantity: 1,
+      pricePerUnit: 2500,
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data.productId).toBe("prod-1");
+  });
+
+  it("accepts a single product the merchant prices at 0 — the price is display-only", () => {
+    const result = storeOrderSchema.safeParse({
+      ...customer,
+      productId: "prod-1",
+      productName: "Sample",
+      quantity: 1,
+      pricePerUnit: 0,
+    });
+
+    expect(result.success).toBe(true);
+  });
+
+  it("still refuses a negative display price", () => {
+    const result = storeOrderSchema.safeParse({
+      ...customer,
+      productId: "prod-1",
+      productName: "Sample",
+      quantity: 1,
+      pricePerUnit: -1,
+    });
+
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects a request that names neither a basket nor a product", () => {
+    const result = storeOrderSchema.safeParse({ ...customer });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.map((i) => i.path.join("."))).toContain("productId");
+    }
+  });
+
+  it("rejects a product named without a price", () => {
+    // Half a single-product order is not an order; the price is what the
+    // legacy path needs and the basket path supplies per line.
+    const result = storeOrderSchema.safeParse({
+      ...customer,
+      productId: "prod-1",
+      productName: "T-shirt",
+    });
+
+    expect(result.success).toBe(false);
+  });
+
+  it("does not let an empty basket stand in for a product", () => {
+    const result = storeOrderSchema.safeParse({ ...customer, items: [] });
+
+    expect(result.success).toBe(false);
+  });
+});
+
+describe("storeOrderSchema Meta cookies", () => {
+  const order = orderWith("0551234567");
+
+  it("keeps a well-formed _fbc and _fbp, Parameter Builder appendix included", () => {
+    const parsed = storeOrderSchema.parse({
+      ...order,
+      fbc: "fb.1.1709136167115.IwAR2F4-dbP0l7Mn1IawQQGCINEz7PYXQvwjNwB.ABcDEFGh",
+      fbp: "fb.1.1596403881668.1116446470.ABcDEFGh",
+    });
+    expect(parsed.fbc).toBe("fb.1.1709136167115.IwAR2F4-dbP0l7Mn1IawQQGCINEz7PYXQvwjNwB.ABcDEFGh");
+    expect(parsed.fbp).toBe("fb.1.1596403881668.1116446470.ABcDEFGh");
+  });
+
+  it("takes the order and drops a malformed cookie instead of refusing it", () => {
+    for (const [fbc, fbp] of [["IwAR2F4abc", "1116446470"], ["", ""], [42, { a: 1 }], ["fb.1.1700000000.abc", "fb.1.1700000001.123"]] as const) {
+      const result = storeOrderSchema.safeParse({ ...order, fbc, fbp });
+      expect(result.success, JSON.stringify([fbc, fbp])).toBe(true);
+      if (result.success) {
+        expect(result.data.fbc).toBeUndefined();
+        expect(result.data.fbp).toBeUndefined();
+      }
+    }
+  });
+});

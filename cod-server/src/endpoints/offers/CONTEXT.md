@@ -1,0 +1,79 @@
+# Offers Context
+
+Promotions the server applies on its own at checkout, unasked. Three kinds: Buy X Get Y, Buy X Get Free Delivery, and Quantity Pricing.
+
+## Language
+
+### Offer Anatomy
+
+**Offer**:
+A promotion applied automatically to a product at checkout. The merchant configures it; the shopper never enters anything.
+_Avoid_: Coupon, discount code, promo code (a coupon is something a shopper enters — a separate concept)
+
+**Trigger**:
+The product an offer is about, optionally locked to one variant, and the quantity that qualifies.
+_Avoid_: Condition, requirement
+
+**Counted Units**:
+The units an offer judges a basket by: every line of the product across its variants, or only the variant the offer is locked to.
+_Avoid_: Total quantity (ambiguous once variants are locked)
+
+**Reward**:
+The goods a Buy X Get Y offer gives: a product and quantity added to the order at no charge, once per order whatever the quantity bought.
+_Avoid_: Prize, bonus
+
+**Free Delivery Offer**:
+An offer whose benefit is delivery itself: the delivery fee drops to zero, for a basket of that product alone.
+_Avoid_: Shipping discount
+
+**Quantity Pricing**:
+An offer that prices a product by how many are bought, through Price Tiers ("1 for 2,000 DA, 2 for 3,500 DA, 3 for 4,500 DA").
+_Avoid_: Bundle, volume discount, pack offer
+
+**Price Tier**:
+One step of Quantity Pricing: from a quantity, a price for that many — and optionally free delivery. The highest tier the Counted Units reach applies, its per-unit price covering every unit.
+_Avoid_: Level, bracket
+
+**Schedule**:
+Optional start and end. No start means live immediately; no end means it never expires; an end always comes after the start.
+_Avoid_: Campaign window
+
+**Offer Status**:
+A manual `active` / `inactive` switch. Only an active offer within its schedule is live.
+_Avoid_: Enabled flag
+
+### Application
+
+**One Offer per Product**:
+A product gets at most one offer per order. An offer qualifies when its threshold is reached and it can give its benefit — a reward the stock covers, free delivery for a basket of that product alone. Among those, the shopper's pick wins if it qualifies on its own; otherwise the highest threshold reached. Quantity Pricing is never live beside another offer for the same product.
+_Avoid_: Stacking
+
+**Applied Offer**:
+The offer a product was given in an order. Every line of the product it counted names it, and a coupon never covers those lines.
+
+**Live Offer**:
+An offer active and within its schedule right now.
+
+**Reward Out of Stock**:
+A reward the stock cannot cover — once the units the shopper pays for and the rewards placed before are counted — makes its offer not qualify: the product falls to its next offer, and the cart quote never promises it.
+_Avoid_: Out-of-stock error, reward left out
+
+## Boundaries
+
+- **Where application happens**: the storefront checkout and its cart quote apply offers through one pricing path, so what the shopper is shown is what the order charges.
+- **Delivery fee mechanics**: Shipping Profiles context — an offer can make the fee zero, never compute it.
+- **Trigger / reward products**: Products context — deleting a product deletes the offers about it.
+- **Order lines**: Orders context — a line records the offer applied to it, and a reward line is marked as a reward.
+- **Coupons**: Coupons context — a shopper-entered code, applied after offers and never to a product an offer applied to.
+
+## Edge Cases
+
+**A locked variant counts alone**: "Buy 2 Red" needs two Red; one Red and one Blue do not qualify.
+
+**A mixed basket earns no offer free delivery**: free delivery from an offer or a tier needs a basket of that product alone; a mixed basket earns free delivery only from the store's threshold.
+
+**A tier at the catalog price is no offer**: one robe at its catalog price under "1 for 2,000 DA" changes nothing, so the offer does not apply — and a coupon can cover that robe.
+
+**Tiers share their price across sizes**: two sizes bought under one tier pay the tier's price together, split so the lines add up to it exactly.
+
+**Deleting products deletes offers**: no offer outlives the product it is about.

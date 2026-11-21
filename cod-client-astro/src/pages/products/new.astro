@@ -1,0 +1,12 @@
+---
+import DashboardLayout from "@/layouts/DashboardLayout.astro";
+import { PageSkeleton } from "@/components/layout/PageSkeleton";
+import ProductFormPageApp from "@/features/products/components/ProductFormPageApp";
+---
+
+<DashboardLayout>
+  <PageSkeleton gate="required" />
+  <div data-auth-gate="required" hidden>
+    <ProductFormPageApp client:only="react" />
+  </div>
+</DashboardLayout>

@@ -1,0 +1,433 @@
+import { checkProductCollections, withCollections } from "@/lib/product-collections";
+import { removeProduct } from "@/lib/remove-product";
+import { tool } from "ai";
+import { z } from "zod";
+import * as queries from "./queries";
+import {
+  productFiltersSchema,
+  createProductSchema,
+  updateProductSchema,
+  updateStatusSchema,
+} from "./validation";
+import { getDb } from "@/db";
+import { mediaDeliveryOf } from "@/lib/media";
+import type { Env } from "@/types/env";
+import { toolOutput, timestampSchema } from "@/lib/tool-output-schema";
+import { toolId } from "@/lib/tool-input";
+
+/**
+ * Layer-2 validation schemas, hoisted to module level and exported so the MCP
+ * layer (src/mcp/schemas.ts) can derive tools/list inputSchema from the exact
+ * same definitions — the advertised schema and the executed validation cannot
+ * drift apart.
+ */
+export const listProductsSchema = productFiltersSchema;
+export const getProductDetailsSchema = z.object({
+  productId: toolId().describe("The ID of the product to retrieve"),
+});
+export const createNewProductSchema = createProductSchema;
+export const updateProductDetailsSchema = z.object({
+  productId: toolId().describe("The ID of the product to update"),
+  updates: updateProductSchema,
+});
+export const updateProductStatusToolSchema = z.object({
+  productId: toolId().describe("The ID of the product"),
+  status: updateStatusSchema.shape.status,
+});
+export const deleteProductSchema = z.object({
+  productId: toolId().describe("The ID of the product to delete"),
+});
+
+export const PRODUCT_TOOL_SCHEMAS: Record<string, z.ZodRawShape> = {
+  listProducts: listProductsSchema.shape,
+  getProductDetails: getProductDetailsSchema.shape,
+  createNewProduct: createNewProductSchema.shape,
+  updateProductDetails: updateProductDetailsSchema.shape,
+  updateProductStatus: updateProductStatusToolSchema.shape,
+  deleteProduct: deleteProductSchema.shape,
+};
+
+const productRowSchema = z.looseObject({
+  id: z.string().describe("Product ID"),
+  name: z.string(),
+  handle: z.string().describe("Unique URL slug"),
+  price: z.number().describe("Price in DZD (integer, smallest unit)"),
+  sku: z.string().nullable().optional().describe("Merchant-facing code — set on simple products only"),
+  status: z.string().optional().describe("DRAFT | ACTIVE | ARCHIVED"),
+  visibility: z.boolean().optional().describe("Master internal switch — off means hidden everywhere"),
+  hasVariants: z.boolean().optional().describe("True → stock and pricing live on variants"),
+  descriptionFormat: z.enum(["text", "html"]).describe(
+    "How description is stored: 'text' renders as literal text (legacy), 'html' is sanitised rich text"
+  ),
+  descriptionPlain: z.string().nullable().describe(
+    "Tag-free rendering of description for SEO/meta; identical to description for text rows"
+  ),
+});
+
+export const PRODUCT_TOOL_OUTPUT_SCHEMAS: Record<string, z.ZodType> = {
+  listProducts: toolOutput({
+    count: z.number().int(),
+    products: z.array(
+      z.looseObject({
+        id: z.string().describe("Product ID"),
+        name: z.string(),
+        handle: z.string().describe("Unique URL slug"),
+        sku: z.string().nullable().describe("Null on variant products (SKU lives on each variant)"),
+        price: z.number().describe("Price in DZD"),
+        status: z.string().describe("DRAFT | ACTIVE | ARCHIVED"),
+        visibility: z.boolean(),
+        hasVariants: z.boolean(),
+        variantsCount: z.number().int(),
+        totalInventory: z.number().int().describe("Variant stock sum, or own stock for simple products"),
+        primaryImage: z.object({ key: z.string(), url: z.string(), width: z.number().nullable(), height: z.number().nullable() }).nullable().describe("The first image of the gallery"),
+        categoryId: z.string().nullable(),
+        tags: z.array(z.string()),
+        reviewCount: z.number().int().describe("Approved reviews only"),
+        avgRating: z.number().nullable().describe("Average of approved reviews, or null"),
+        showInStore: z.boolean().describe("Storefront-only visibility switch"),
+      }),
+    ).describe("Products matching the filters"),
+  }),
+  getProductDetails: toolOutput({
+    product: productRowSchema.describe("Full product: variants, images, category, and review aggregates"),
+  }),
+  createNewProduct: toolOutput({
+    product: productRowSchema.describe("The created product"),
+    message: z.string(),
+  }),
+  updateProductDetails: toolOutput({
+    product: productRowSchema.describe("The updated product"),
+    message: z.string(),
+  }),
+  updateProductStatus: toolOutput({
+    product: productRowSchema.describe("The product with its new status"),
+    message: z.string(),
+  }),
+  deleteProduct: toolOutput({
+    message: z.string(),
+  }),
+};
+
+/**
+ * AI Tools for Product Management
+ *
+ * These tools allow the AI Agent to interact directly with the products database
+ * logic by reusing existing queries and validation schemas.
+ *
+ * Two-Layer Validation Pattern:
+ * - Layer 1 (LLM-level): Permissive input schema accepts any object to prevent SDK crashes
+ * - Layer 2 (App-level): Strict validation inside execute() with graceful error handling
+ *
+ * This ensures the AI agent can recover from validation errors without breaking the conversation.
+ *
+ * Product domain notes:
+ * - Simple products (hasVariants=false) MUST include a `sku` field.
+ * - Variant products (hasVariants=true) carry SKU on each variant — omit `sku` at product level.
+ * - Prices are always integers in DZD (Algerian Dinar), smallest unit.
+ * - Status values: DRAFT | ACTIVE | ARCHIVED. Setting ACTIVE auto-sets publishedAt.
+ * - Delete removes the product for good, even one that orders hold (their lines keep what was sold).
+ */
+export const getProductTools = (db: ReturnType<typeof getDb>, env: Env) => ({
+
+  listProducts: tool({
+    description:
+      "Search and filter the product catalog. Returns product info including inventory levels, variant counts, primary image, review stats, and status. Use this to find products by name, category, status, or visibility.",
+    inputSchema: z.object({}).passthrough(), // Layer 1: Permissive input
+    execute: async (args) => {
+      // Layer 2: Strict validation with graceful error handling
+      const parsed = listProductsSchema.safeParse(args);
+
+      if (!parsed.success) {
+        const errorDetails = parsed.error.issues
+          .map((e: any) => `${e.path.join(".")}: ${e.message}`)
+          .join("; ");
+        return {
+          success: false,
+          error: `Invalid filter arguments: ${errorDetails}. Expected: categoryId (string, optional), status (DRAFT|ACTIVE|ARCHIVED, optional), visibility (boolean, optional), search (string, optional), limit (1-100, default 50), offset (number, default 0)`,
+        };
+      }
+
+      try {
+        const products = await queries.getAllProducts(db, mediaDeliveryOf(env), parsed.data);
+        return {
+          success: true,
+          count: products.length,
+          products: products.map((p) => ({
+            id: p.id,
+            name: p.name,
+            handle: p.handle,
+            sku: p.sku,
+            price: p.price,
+            status: p.status,
+            visibility: p.visibility,
+            hasVariants: p.hasVariants,
+            variantsCount: p.variantsCount,
+            totalInventory: p.totalInventory,
+            primaryImage: p.primaryImage,
+            categoryId: p.categoryId,
+            tags: p.tags,
+            reviewCount: p.reviewCount,
+            avgRating: p.avgRating,
+            showInStore: p.showInStore,
+          })),
+        };
+      } catch (error: any) {
+        return {
+          success: false,
+          error: `Database error: ${error.message}`,
+        };
+      }
+    },
+  }),
+
+  getProductDetails: tool({
+    description:
+      "Fetch full details for a specific product, including its category, all variants (with their SKUs, prices, and inventory), and images. Use this before updating or when you need complete product data.",
+    inputSchema: z.object({}).passthrough(), // Layer 1: Permissive input
+    execute: async (args) => {
+      // Layer 2: Strict validation
+      const validationSchema = getProductDetailsSchema;
+
+      const parsed = validationSchema.safeParse(args);
+
+      if (!parsed.success) {
+        const errorDetails = parsed.error.issues
+          .map((e: any) => `${e.path.join(".")}: ${e.message}`)
+          .join("; ");
+        return {
+          success: false,
+          error: `Invalid arguments: ${errorDetails}. Expected: productId (ID string)`,
+        };
+      }
+
+      try {
+        const product = await queries.getProductById(db, parsed.data.productId, mediaDeliveryOf(env));
+        if (!product) {
+          return {
+            success: false,
+            error: `Product not found with ID: ${parsed.data.productId}`,
+          };
+        }
+        return { success: true, product };
+      } catch (error: any) {
+        return {
+          success: false,
+          error: `Database error: ${error.message}`,
+        };
+      }
+    },
+  }),
+
+  createNewProduct: tool({
+    description:
+      "Creates a new product in the catalog. " +
+      "SIMPLE PRODUCTS (hasVariants=false, the default): must include `sku` (unique), `name`, and `price` (integer DZD). " +
+      "VARIANT PRODUCTS (hasVariants=true): omit `sku` here — each variant carries its own SKU added via createProductVariant. " +
+      "Optional: description, descriptionFormat ('text'|'html'; 'text' renders literally, 'html' is sanitised server-side against the rich-text allow-list), handle (auto-generated from name if omitted), compareAtPrice, costPrice, type (PHYSICAL|DIGITAL), " +
+      "variantOptions (array of {name, values}), inventory (default 0), lowStockThreshold (default 5), trackInventory (default true), " +
+      "categoryId, tags (string array), visibility (default true), status (DRAFT|ACTIVE|ARCHIVED, default ACTIVE), " +
+      "showInStore (default true), shippingProfileId, collectionIds (the curated lists it joins, e.g. Featured or Best sellers).",
+    inputSchema: z.object({}).passthrough(), // Layer 1: Permissive input
+    execute: async (args) => {
+      // Layer 2: Strict validation
+      const parsed = createNewProductSchema.safeParse(args);
+
+      if (!parsed.success) {
+        const errorDetails = parsed.error.issues
+          .map((e: any) => `${e.path.join(".")}: ${e.message}`)
+          .join("; ");
+        return {
+          success: false,
+          error:
+            `Invalid product data: ${errorDetails}. ` +
+            `Required: name (string), price (integer DZD ≥ 0). ` +
+            `SKU rules: required for simple products (hasVariants=false), must be unique. ` +
+            `Optional: description, handle, compareAtPrice, costPrice, type (PHYSICAL|DIGITAL), ` +
+            `hasVariants (boolean), variantOptions (array), inventory (int ≥ 0), ` +
+            `lowStockThreshold (int ≥ 0), trackInventory (boolean), categoryId, tags (string[]), ` +
+            `visibility (boolean), status (DRAFT|ACTIVE|ARCHIVED), showInStore (boolean), ` +
+            `shippingProfileId, collectionIds (string[]).`,
+        };
+      }
+
+      try {
+        // Identity conflict check before insert, so the answer names the field.
+        const conflict = await queries.findProductIdentityConflict(db, {
+          ...(parsed.data.handle !== undefined ? { handle: parsed.data.handle } : {}),
+          ...(parsed.data.sku !== undefined ? { sku: parsed.data.sku } : {}),
+        });
+        if (conflict) {
+          return conflict.field === "sku"
+            ? {
+                success: false,
+                error: `A product with SKU "${parsed.data.sku}" already exists (ID: ${conflict.existingId}). Use a different SKU.`,
+              }
+            : {
+                success: false,
+                error: `A product with handle "${parsed.data.handle}" already exists (ID: ${conflict.existingId}). Use a different handle, or omit it to auto-generate one.`,
+              };
+        }
+
+        const { collectionIds, ...data } = parsed.data;
+        const collections = await checkProductCollections(db, collectionIds);
+        if (!collections.ok) return { success: false, error: `Unknown collections: ${collections.unknown.join(", ")}.` };
+        const product = await queries.createProduct(db, data, mediaDeliveryOf(env));
+        await collections.apply(product!.id);
+        return {
+          success: true,
+          product: await withCollections(db, product!),
+          message: `Product "${parsed.data.name}" created successfully`,
+        };
+      } catch (error: any) {
+        const msg = String(error?.message ?? error);
+        if (/UNIQUE constraint failed: products\.handle/i.test(msg)) {
+          return {
+            success: false,
+            error: `A product with handle "${parsed.data.handle}" already exists. Use a different handle, or omit it to auto-generate one.`,
+          };
+        }
+        if (/UNIQUE constraint failed: products\.sku/i.test(msg)) {
+          return {
+            success: false,
+            error: `A product with SKU "${parsed.data.sku}" already exists. Use a different SKU.`,
+          };
+        }
+        return {
+          success: false,
+          error: `Failed to create product: ${msg}`,
+        };
+      }
+    },
+  }),
+
+  updateProductDetails: tool({
+    description:
+      "Partially updates an existing product. Only include fields you want to change — all fields are optional. " +
+      "Setting status to ACTIVE auto-sets publishedAt. " +
+      "Send variantOptions: null to clear variant options when converting a variant product to simple. " +
+      "Cannot change SKU to null — if provided, must be a non-empty string.",
+    inputSchema: z.object({}).passthrough(), // Layer 1: Permissive input
+    execute: async (args) => {
+      // Layer 2: Strict validation
+      const validationSchema = updateProductDetailsSchema;
+
+      const parsed = validationSchema.safeParse(args);
+
+      if (!parsed.success) {
+        const errorDetails = parsed.error.issues
+          .map((e: any) => `${e.path.join(".")}: ${e.message}`)
+          .join("; ");
+        return {
+          success: false,
+          error:
+            `Invalid update arguments: ${errorDetails}. ` +
+            `Expected: productId (ID), updates object with optional fields: ` +
+            `name, description, handle, price (int DZD), compareAtPrice, costPrice, ` +
+            `type (PHYSICAL|DIGITAL), hasVariants, variantOptions (array or null), ` +
+            `sku (non-empty string), inventory (int ≥ 0), lowStockThreshold, trackInventory, ` +
+            `categoryId (string or null), tags (string[]), visibility, ` +
+            `status (DRAFT|ACTIVE|ARCHIVED), showInStore, shippingProfileId, collectionIds (string[], replaces its collections).`,
+        };
+      }
+
+      try {
+        const { collectionIds, ...updates } = parsed.data.updates;
+        const collections = await checkProductCollections(db, collectionIds);
+        if (!collections.ok) return { success: false, error: `Unknown collections: ${collections.unknown.join(", ")}.` };
+        const product = await queries.updateProduct(db, parsed.data.productId, updates, mediaDeliveryOf(env));
+        if (!product) {
+          return {
+            success: false,
+            error: `Product not found with ID: ${parsed.data.productId}`,
+          };
+        }
+        await collections.apply(product.id);
+        return {
+          success: true,
+          product: await withCollections(db, product),
+          message: "Product updated successfully",
+        };
+      } catch (error: any) {
+        return {
+          success: false,
+          error: `Failed to update product: ${error.message}`,
+        };
+      }
+    },
+  }),
+
+  updateProductStatus: tool({
+    description:
+      "Changes a product's publication status. Valid values: DRAFT (hidden, not published), ACTIVE (live — auto-sets publishedAt), ARCHIVED (discontinued). Use this for quick status changes without touching other fields.",
+    inputSchema: z.object({}).passthrough(), // Layer 1: Permissive input
+    execute: async (args) => {
+      // Layer 2: Strict validation
+      const validationSchema = updateProductStatusToolSchema;
+
+      const parsed = validationSchema.safeParse(args);
+
+      if (!parsed.success) {
+        const errorDetails = parsed.error.issues
+          .map((e: any) => `${e.path.join(".")}: ${e.message}`)
+          .join("; ");
+        return {
+          success: false,
+          error: `Invalid arguments: ${errorDetails}. Expected: productId (ID), status (one of: DRAFT, ACTIVE, ARCHIVED)`,
+        };
+      }
+
+      try {
+        const product = await queries.updateProduct(db, parsed.data.productId, {
+          status: parsed.data.status,
+        }, mediaDeliveryOf(env));
+        if (!product) {
+          return {
+            success: false,
+            error: `Product not found with ID: ${parsed.data.productId}`,
+          };
+        }
+        return {
+          success: true,
+          product,
+          message: `Product status updated to ${parsed.data.status}`,
+        };
+      } catch (error: any) {
+        return {
+          success: false,
+          error: `Failed to update product status: ${error.message}`,
+        };
+      }
+    },
+  }),
+
+  deleteProduct: tool({
+    description:
+      "Removes a product for good — even one that orders hold — and frees its handle and SKU. Its variants, images, reviews, stock history, offers and landing pages go with it. " +
+      "Order lines that sold it keep what was sold (name, label, SKU, price) and lose only the link; orders still to ship that hold it can no longer put it back in stock. " +
+      "This cannot be undone: tell the user what goes and get their explicit confirmation first. To stop selling it but keep it, use updateProductStatus with ARCHIVED instead.",
+    inputSchema: z.object({}).passthrough(), // Layer 1: Permissive input
+    execute: async (args) => {
+      // Layer 2: Strict validation
+      const parsed = deleteProductSchema.safeParse(args);
+      if (!parsed.success) {
+        const errorDetails = parsed.error.issues.map((e: any) => `${e.path.join(".")}: ${e.message}`).join("; ");
+        return { success: false, error: `Invalid arguments: ${errorDetails}. Expected: productId (ID string)` };
+      }
+
+      try {
+        const removal = await queries.productRemoval(db, parsed.data.productId);
+        if (!removal) return { success: false, error: `Product not found with ID: ${parsed.data.productId}` };
+        await removeProduct(db, env, parsed.data.productId);
+        return {
+          success: true,
+          message:
+            `Product "${removal.name}" deleted, with ${removal.variants} variant(s), ${removal.images} image(s), ${removal.reviews} review(s), ` +
+            `${removal.offers} offer(s) and ${removal.landingPages} landing page(s). ${removal.orderLines} order line(s) keep what was sold.`,
+        };
+      } catch (error: any) {
+        return { success: false, error: `Failed to delete product: ${error.message}` };
+      }
+    },
+  }),
+
+});

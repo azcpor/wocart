@@ -1,0 +1,113 @@
+/**
+ * Analytics Routes
+ *
+ * Read-only endpoints that serve aggregated stats for the dashboard and
+ * any future reporting features.
+ * Built with defineRoute() — the standard route-builder pattern.
+ */
+
+import { OpenAPIHono, z } from "@hono/zod-openapi";
+import type { AppContext } from "@/types";
+import { defineRoute } from "@/lib/route-builder";
+import { SCOPES } from "../../../../cod-shared/rbac/scopes";
+import { getOrderActivityStats, getOrderStages } from "./handlers";
+import { ACTIVITY_WINDOWS } from "../../../../cod-shared/queries/analytics";
+import { ORDER_STAGES } from "../../../../cod-shared/orders/stage";
+
+const orderStagesRoute = defineRoute({
+  method: "get",
+  path: "/order-stages",
+  auth: { anyOf: [SCOPES.DASHBOARD_VIEW, SCOPES.ORDERS_READ, SCOPES.ORDERS_READ_ASSIGNED] },
+  tags: ["Analytics"],
+  summary: "Orders by stage",
+  description:
+    "Orders counted by the stage the merchant sees — their processing, then their shipment's delivery (the same stage as `GET /api/orders/{id}`) — with only the stages that have orders, how many orders need the merchant's attention, how many are archived, and the delivery rate (only their own orders for a member who sees only theirs); `archived=exclude` leaves archived orders out of the stages, as the working lists do (an unknown handoff, a parcel the carrier cancelled or flagged).",
+  operationId: "getOrderStageStats",
+  query: z.object({
+    archived: z
+      .enum(["include", "exclude"])
+      .default("include")
+      .describe("Count archived orders in the stages (include — every order) or leave them out (exclude — the working lists' counts)"),
+  }),
+  responses: {
+    200: {
+      description: "Orders per stage, and the count needing attention",
+      content: {
+        "application/json": {
+          schema: z.object({
+            success: z.boolean().openapi({ example: true }),
+            data: z.object({
+              stages: z.array(z.object({ stage: z.enum(ORDER_STAGES), count: z.number().int().openapi({ example: 12 }) })),
+              needsAttention: z.number().int().openapi({ example: 3 }),
+              archived: z.number().int().openapi({ description: "Archived orders", example: 40 }),
+              callbacks: z.number().int().openapi({ description: "Orders still waiting (new, or the customer not reached) with a callback set; an agent who sees only their own orders counts only theirs", example: 4 }),
+              callbacksDue: z.number().int().openapi({ description: "Of those, the ones whose callback time has come", example: 1 }),
+              noAnswer: z
+                .object({
+                  call1: z.number().int().openapi({ example: 6 }),
+                  call2: z.number().int().openapi({ example: 3 }),
+                  call3OrMore: z.number().int().openapi({ example: 2 }),
+                })
+                .openapi({ description: "Orders on no answer (unreachable) by their call: after one call without an answer, two, or three and more" }),
+              deliveryRate: z.number().int().min(0).max(100).nullable().openapi({
+                description: "Of the parcels whose delivery ended — delivered or returned — the share delivered, a whole percent; null before any ended. A return under way and a parcel the carrier cancelled count for neither.",
+                example: 82,
+              }),
+            }),
+          }),
+        },
+      },
+    },
+  },
+  handler: getOrderStages,
+});
+
+const activityDay = z.object({
+  date: z.string().openapi({ example: "2026-10-16" }),
+  orders: z.number().int().openapi({ example: 14 }),
+  orderValue: z.number().openapi({ example: 52400 }),
+});
+
+const orderActivityRoute = defineRoute({
+  method: "get",
+  path: "/order-activity",
+  auth: { anyOf: [SCOPES.DASHBOARD_VIEW, SCOPES.ORDERS_READ] },
+  tags: ["Analytics"],
+  summary: "Orders placed per day",
+  description:
+    "Orders placed per store day (Algeria, UTC+1) over the last `days` days, today included, and what they are worth (price plus delivery fee), with the totals of the same number of days just before for comparison. Cancelled orders are left out. Only days with orders appear.",
+  operationId: "getOrderActivity",
+  query: z.object({
+    days: z
+      .enum(ACTIVITY_WINDOWS.map(String) as ["7", "30", "90"])
+      .default("30")
+      .transform(Number)
+      .openapi({ description: "How many days the window spans", example: "30" }),
+  }),
+  responses: {
+    200: {
+      description: "Orders and their value per day, and the previous window's totals",
+      content: {
+        "application/json": {
+          schema: z.object({
+            success: z.boolean().openapi({ example: true }),
+            data: z.object({
+              from: z.string().openapi({ example: "2026-09-17" }),
+              to: z.string().openapi({ example: "2026-10-16" }),
+              days: z.array(activityDay),
+              previous: z.object({ orders: z.number().int(), orderValue: z.number() }),
+            }),
+          }),
+        },
+      },
+    },
+  },
+  handler: getOrderActivityStats,
+});
+
+const router = new OpenAPIHono<AppContext>();
+
+router.openapi(orderStagesRoute.route, orderStagesRoute.handler);
+router.openapi(orderActivityRoute.route, orderActivityRoute.handler);
+
+export default router;

@@ -1,0 +1,38 @@
+---
+import BaseLayout from "@/layouts/BaseLayout.astro";
+import { PageSkeleton } from "@/components/layout/PageSkeleton";
+import PrintDeliverySheetApp from "@/features/shipping-labels/components/PrintDeliverySheetApp";
+---
+
+<BaseLayout title="Wocart">
+  <main class="min-h-screen">
+    <PageSkeleton gate="required" />
+    <div data-auth-gate="required" hidden>
+      <PrintDeliverySheetApp client:only="react" />
+    </div>
+  </main>
+</BaseLayout>
+
+<style is:global>
+  @page {
+    size: A4;
+    margin: 12mm;
+  }
+  @media print {
+    html,
+    body,
+    .print-sheet {
+      background: #fff !important;
+      padding: 0 !important;
+    }
+    .print-toolbar,
+    astro-dev-toolbar {
+      display: none !important;
+    }
+    .sheet-page {
+      box-shadow: none !important;
+      padding: 0 !important;
+      width: auto !important;
+    }
+  }
+</style>

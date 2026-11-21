@@ -1,0 +1,113 @@
+/**
+ * The Event Catalogue keeps its promises (ADR 0018):
+ *   - every current version is released, and no released type disappears;
+ *   - a current version never breaks its released snapshot, and its snapshot
+ *     is advanced with every field it adds, so none is published unpromised;
+ *   - the schemas consumers are promised are exactly the types writers build;
+ *   - data writers build is accepted by its schema.
+ */
+
+import { readdirSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { describe, expect, expectTypeOf, it } from "vitest";
+import type { z } from "zod";
+import { EVENT_CATALOGUE, EVENT_TYPES, type EventDataMap, type EventType } from "../../../cod-shared/events/catalogue";
+import { sampleOrder, sampleShipment } from "@/test-utils/events";
+import { breakingChanges } from "./compatibility";
+import type { BusinessEvent } from "../../../cod-shared/events/log";
+import { BUSINESS_EVENT_SCHEMA, EVENT_DATA_SCHEMAS, eventDataJsonSchema, parseReleasedSnapshotName, releasedSnapshotName } from "./catalogue";
+
+const RELEASED = resolve(import.meta.dirname, "released");
+const released = readdirSync(RELEASED).map((file) => {
+  const parsed = parseReleasedSnapshotName(file);
+  if (!parsed) throw new Error(`${file} is not a released snapshot name (<type>.v<version>.json)`);
+  return { file, ...parsed, schema: JSON.parse(readFileSync(resolve(RELEASED, file), "utf8")) as Record<string, unknown> };
+});
+
+describe("the Event Catalogue", () => {
+  it("names every type subject.what, with the subject the catalogue gives it", () => {
+    for (const type of EVENT_TYPES) {
+      expect(type).toMatch(/^[a-z]+\.[a-z]+(_[a-z]+)*$/);
+      expect(type.split(".")[0]).toBe(EVENT_CATALOGUE[type].subject);
+    }
+  });
+
+  it.each(EVENT_TYPES)("has released %s's current version", (type) => {
+    const name = releasedSnapshotName(type, EVENT_CATALOGUE[type].version);
+    expect(released.map((r) => r.file), `${name} is missing — run npm run events:release-catalogue`).toContain(name);
+  });
+
+  it.each(released.map((r) => [r.file, r] as const))("still publishes %s", (_, snapshot) => {
+    expect(EVENT_TYPES, `${snapshot.type} was released and can never be removed`).toContain(snapshot.type);
+    const current = EVENT_CATALOGUE[snapshot.type as EventType].version;
+    expect(current, `${snapshot.type}'s version went backwards`).toBeGreaterThanOrEqual(snapshot.version);
+    expect(current, `${snapshot.type} v${current} needs the renderer that keeps producing v${snapshot.version} before it can ship`).toBe(snapshot.version);
+  });
+
+  it.each(released.map((r) => [r.file, r] as const))("never breaks the released %s", (_, snapshot) => {
+    expect(breakingChanges(snapshot.schema, eventDataJsonSchema(snapshot.type as EventType))).toEqual([]);
+  });
+
+  it.each(EVENT_TYPES)("promises every field %s's current version publishes", (type) => {
+    const snapshot = released.find((r) => r.file === releasedSnapshotName(type, EVENT_CATALOGUE[type].version));
+    expect(snapshot?.schema, `${type}'s snapshot is behind its schema — run npm run events:release-catalogue`).toEqual(eventDataJsonSchema(type));
+  });
+
+  it("promises consumers exactly the data writers build", () => {
+    expectTypeOf<{ [T in EventType]: z.output<(typeof EVENT_DATA_SCHEMAS)[T]> }>().toEqualTypeOf<EventDataMap>();
+  });
+
+  it.each(EVENT_TYPES)("accepts the data a writer builds for %s", (type) => {
+    expect(EVENT_DATA_SCHEMAS[type].safeParse(SAMPLE[type]).error).toBeUndefined();
+  });
+
+  it("publishes every event exactly as the Event Log reads it", () => {
+    expectTypeOf<z.output<typeof BUSINESS_EVENT_SCHEMA>>().toEqualTypeOf<BusinessEvent>();
+  });
+
+  it.each(EVENT_TYPES)("accepts %s published with its envelope, and refuses it without what its data promises", (type) => {
+    const subject = EVENT_CATALOGUE[type].subject;
+    const published = {
+      id: "evt_1", sequence: 7, type, version: EVENT_CATALOGUE[type].version, subject: { type: subject, id: "s1" }, orderId: "o1",
+      occurredAt: "2026-10-25T09:14:03.120Z", recordedAt: "2026-10-25T09:14:03.180Z",
+      actor: { kind: "staff", id: "u1", name: "Nadia" }, origin: "dashboard", data: SAMPLE[type],
+    };
+    expect(BUSINESS_EVENT_SCHEMA.safeParse(published).error).toBeUndefined();
+    expect(BUSINESS_EVENT_SCHEMA.safeParse({ ...published, actor: { kind: "system", id: "u1", name: "Nadia" } }).success).toBe(false);
+    expect(BUSINESS_EVENT_SCHEMA.safeParse({ ...published, data: { order: {} } }).success).toBe(false);
+    expect(BUSINESS_EVENT_SCHEMA.safeParse({ ...published, subject: { type: subject === "order" ? "shipment" : "order", id: "s1" } }).success).toBe(false);
+  });
+});
+
+const order = sampleOrder;
+const shipment = sampleShipment;
+const report = { shipment, order, reason: null };
+
+const SAMPLE: EventDataMap = {
+  "order.created": { order: { ...order, status: "new" } },
+  "order.updated": { order, changedFields: ["customerPhone", "destination"] },
+  "order.confirmed": { order, previousStatus: "new" },
+  "order.unreachable": { order: { ...order, status: "unreachable" }, previousStatus: "new" },
+  "order.preparing": { order: { ...order, status: "preparing" }, previousStatus: "confirmed" },
+  "order.ready": { order: { ...order, status: "ready" }, previousStatus: "preparing" },
+  "order.cancelled": { order: { ...order, status: "cancelled" }, previousStatus: "confirmed" },
+  "order.line_returned": { order, lineId: "l-1", previousReturnedQuantity: 0 },
+  "order.deleted": { order },
+  "order.assigned": { order: { ...order, status: "new" }, assignee: { id: "u2", name: "Karim" }, previousAssignee: { id: "u3", name: "Amina" }, way: "take_back" },
+  "order.unassigned": { order: { ...order, status: "new", assignee: null }, previousAssignee: { id: "u2", name: "Karim" } },
+  "order.callback_scheduled": { order: { ...order, status: "unreachable", unansweredCalls: 1, callbackAt: "2026-10-25T13:30:00.000Z" }, at: "2026-10-25T13:30:00.000Z", previousAt: null },
+  "order.callback_cleared": { order: { ...order, status: "unreachable", unansweredCalls: 1 }, previousAt: "2026-10-25T13:30:00.000Z" },
+  "order.callback_due": { order: { ...order, status: "new", callbackAt: "2026-10-25T13:30:00.000Z" }, at: "2026-10-25T13:30:00.000Z" },
+  "shipment.handed_off": { shipment: { ...shipment, outForDeliveryAt: null, providerStatus: null }, order },
+  "shipment.out_for_delivery": report,
+  "shipment.delivery_failed": { ...report, reason: "Client injoignable", attempt: 1 },
+  "shipment.delivered": { ...report, shipment: { ...shipment, deliveredAt: "2026-10-26T14:02:00.000Z" } },
+  "shipment.return_started": report,
+  "shipment.returned": report,
+  "shipment.cancelled": report,
+  "shipment.voided": { shipment, order },
+  "review.submitted": {
+    review: { id: "r-1", product: { id: "p-1", name: "Robe" }, rating: 5, title: null, body: "", status: "approved", verified: true, customerName: "Amina B.", photos: 0, voiceNote: true, submittedAt: "2026-10-27T18:42:10.000Z" },
+    order,
+  },
+};

@@ -1,0 +1,257 @@
+import { useEffect, useState } from "react";
+import {
+  History,
+  Layers,
+  Package,
+  Pencil,
+  Trash2,
+  TrendingUp,
+  X,
+} from "lucide-react";
+import {
+  canScope,
+  useIdentity,
+} from "@/features/auth/components/RequireAuth";
+import {
+  Button,
+  IconButton,
+  LinkButton,
+  Alert,
+  PageHeader,
+  StatCard, StatGroup,
+  Badge,
+} from "@/components/ui";
+import { useLocale, useT } from "@/i18n/react";
+import { notify } from "@/lib/notify";
+import { useRemoveProduct } from "@/features/products/components/useRemoveProduct";
+import { SCOPES } from "../../../../../cod-shared/rbac/scopes";
+import {
+  getProduct,
+  listProductGroups,
+} from "@/features/products/api";
+import {
+  formatMoneyValue,
+  needsSku,
+  productErrorMessage,
+} from "@/features/products/model";
+import type {
+  Product,
+  ProductCategory,
+  ProductStatus,
+} from "@/features/products/types";
+import { StockHistoryDrawer } from "@/features/products/components/StockHistoryDrawer";
+import { ProductVariantsTableCard } from "@/features/products/components/ProductVariantsTableCard";
+import { ProductMobileActionBar } from "@/features/products/components/ProductMobileActionBar";
+import { ProductImagesCard } from "@/features/products/components/ProductImagesCard";
+import { TranslationsCard } from "@/features/translations/components/TranslationsCard";
+
+function Loading() {
+  return (
+    <div role="status" aria-busy="true" className="space-y-4">
+      <div className="h-20 shimmer rounded-xl" />
+      <div className="h-64 shimmer rounded-xl" />
+    </div>
+  );
+}
+
+function ProductStatusBadge({ status }: { status: ProductStatus }) {
+  const t = useT("products");
+  if (status === "ACTIVE")
+    return <Badge tone="success">{t("status_options.active")}</Badge>;
+  if (status === "DRAFT")
+    return <Badge tone="neutral">{t("status_options.draft")}</Badge>;
+  return <Badge tone="critical">{t("status_options.archived")}</Badge>;
+}
+
+export function ProductDetail({ productId }: { productId: string }) {
+  const t = useT("products");
+  const common = useT("common");
+  const auth = useT("auth");
+  const locale = useLocale();
+  const identity = useIdentity();
+  const remove = useRemoveProduct((message) => {
+    setError(message);
+    notify.error(message);
+  });
+  const [product, setProduct] = useState<Product | null>(null);
+  const [categories, setCategories] = useState<ProductCategory[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [history, setHistory] = useState<{
+    open: boolean;
+    variantId?: string;
+    variantLabel?: string | null;
+  }>({ open: false });
+
+  const canManage = canScope(identity, SCOPES.PRODUCTS_MANAGE);
+
+  async function load() {
+    setError(null);
+    try {
+      const [nextProduct, nextCategories] = await Promise.all([
+        getProduct(productId),
+        listProductGroups().catch(() => []),
+      ]);
+      setProduct(nextProduct);
+      setCategories(nextCategories);
+    } catch (cause) {
+      setError(productErrorMessage(cause, t));
+    }
+  }
+  useEffect(() => {
+    if (canScope(identity, SCOPES.PRODUCTS_READ)) void load();
+  }, [productId, identity?.role, identity?.scopes.join(",")]);
+
+  if (!canScope(identity, SCOPES.PRODUCTS_READ))
+    return (
+      <Alert role="alert" tone="critical">
+        {auth("no_access")}
+      </Alert>
+    );
+  if (error && !product)
+    return (
+      <Alert role="alert" tone="critical">
+        <span className="flex-1">{error}</span>
+        <Button type="button" variant="ghost" onClick={() => void load()}>
+          {common("retry")}
+        </Button>
+      </Alert>
+    );
+  if (!product) return <Loading />;
+
+  const category = categories.find((item) => item.id === product.categoryId);
+  const totalInventory = product.totalInventory ?? product.inventory ?? 0;
+
+  async function removeProduct(productToDelete: Product) {
+    if (!(await remove(productToDelete))) return;
+    notify.flashSuccess(t("success_deleted"));
+    window.location.assign("/products");
+  }
+
+  return (
+    <div className="space-y-5 pb-24 lg:pb-0">
+      <PageHeader
+        title={product.name}
+        subtitle={[product.sku, category?.name].filter(Boolean).join(" · ") || product.handle}
+        media={
+          <span className="grid size-12 place-items-center overflow-hidden rounded-lg bg-muted shadow-card">
+            {product.primaryImage ? (
+              <img src={product.primaryImage.url} alt="" className="size-full object-cover" />
+            ) : (
+              <Package size={20} aria-hidden="true" className="text-muted-foreground" />
+            )}
+          </span>
+        }
+        badges={
+          <>
+            <ProductStatusBadge status={product.status} />
+            {product.showInStore === false && <Badge tone="neutral">{t("status.hidden_from_store")}</Badge>}
+          </>
+        }
+        backHref="/products"
+        backLabel={t("page_title")}
+        actions={
+          canManage ? (
+            <div className="hidden gap-2 lg:flex">
+              <LinkButton
+                href={`/products/${encodeURIComponent(product.id)}/edit`}
+                variant="secondary"
+              >
+                <Pencil size={16} />
+                {t("actions.edit")}
+              </LinkButton>
+              <Button
+                type="button"
+                variant="dangerOutline"
+                onClick={() => void removeProduct(product)}
+              >
+                <Trash2 size={16} />
+                {t("actions.delete")}
+              </Button>
+            </div>
+          ) : undefined
+        }
+      />
+      {error && (
+        <Alert role="alert" tone="critical">
+          <span className="flex-1">{error}</span>
+          <button
+            type="button"
+            onClick={() => setError(null)}
+            aria-label={common("cancel")}
+          >
+            <X size={16} />
+          </button>
+        </Alert>
+      )}
+      {needsSku(product) && <Alert tone="warning">{t("detail_no_sku")}</Alert>}
+      <div className="flex items-start gap-2">
+      <StatGroup columns={3} compact className="flex-1">
+        <StatCard
+          label={t("table.price")}
+          value={formatMoneyValue(product.price, locale)}
+          icon={<TrendingUp size={20} />}
+        />
+        <StatCard
+          label={t("table.variants")}
+          value={product.variantsCount ?? product.variants?.length ?? 0}
+          icon={<Layers size={20} />}
+        />
+        <StatCard
+          label={t("stock.in_stock")}
+          value={totalInventory}
+          icon={<Package size={20} />}
+        />
+      </StatGroup>
+        <div className="hidden items-center justify-end gap-2 lg:flex">
+          <IconButton
+            type="button"
+            aria-label={t("actions.stock_history")}
+            title={t("actions.stock_history")}
+            onClick={() => setHistory({ open: true })}
+          >
+            <History size={15} />
+          </IconButton>
+        </div>
+      </div>
+
+      <ProductVariantsTableCard
+        productId={product.id}
+        variants={product.variants ?? []}
+        onOpenHistory={(variantId, label) =>
+          setHistory({
+            open: true,
+            variantId,
+            variantLabel: label,
+          })
+        }
+      />
+
+      <ProductImagesCard
+        productName={product.name}
+        images={product.images ?? []}
+      />
+
+      <TranslationsCard
+        resource="product"
+        id={product.id}
+        canEdit={canScope(identity, SCOPES.PRODUCTS_UPDATE)}
+      />
+
+      <ProductMobileActionBar
+        editHref={`/products/${encodeURIComponent(product.id)}/edit`}
+        canManage={canManage}
+        onHistory={() => setHistory({ open: true })}
+        onDelete={() => void removeProduct(product)}
+      />
+
+      <StockHistoryDrawer
+        productId={product.id}
+        variantId={history.variantId}
+        productName={product.name}
+        variantLabel={history.variantLabel}
+        open={history.open}
+        onClose={() => setHistory({ open: false })}
+      />
+    </div>
+  );
+}

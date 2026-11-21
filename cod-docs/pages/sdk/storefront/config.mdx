@@ -1,0 +1,367 @@
+---
+description: Read store settings and languages, route languages, and render the checkout policy the store actually uses.
+---
+
+import { Callout } from "zudoku/ui/Callout";
+
+# Store config and languages
+
+`config.get()` is the first read of most pages. It returns the store's public
+settings or `null` when they cannot be read.
+
+```ts
+import { createStore } from "../lib/store";
+
+const config = await createStore().config.get();
+```
+
+A null config is a real failure — the API is unreachable, the key is wrong —
+not an empty store. You have two honest answers:
+
+- **Render the SDK's unavailable store**, `unavailableStoreConfig({ serverUrl,
+  locale })`, the way `resolveStoreRequest` does with its `fallback` option
+  ([below](#one-request-one-language)). The page stays up with nothing to buy.
+- **Answer an error page** (`503`) for a page that cannot work without the
+  store.
+
+Either way, the cause is in the client's `onError`.
+
+## What the config contains
+
+| Group | Fields | Use it for |
+| --- | --- | --- |
+| Identity | `id`, `name`, `domain`, `logo` | Page title, header, sharing. `id` is `""` only for the unavailable store |
+| Languages | `lang`, `locale`, `locales` | `<html lang>` and `dir`, switcher, links |
+| Currency | `currency`, `currencySymbol` | `formatMoney`; `currencySymbol` is in `locale` (`دج` in Arabic, `DA` in French) |
+| SEO | `metaTitle`, `metaDescription`, `ogImage` | Head metadata |
+| Media | `media` | Where every image key is served from and how it is resized: pass it to the image helpers |
+| Features | `reviewsEnabled`, `cartEnabled`, `otpEnabled`, `turnstileEnabled`, `turnstileSiteKey` | Whether to render a surface; the public widget key |
+| Cart | `freeShippingThreshold` | Copy and display only; the quote owns the fee |
+| Checkout | `checkoutForm` | Which fields to render and which are required |
+| Tracking | `pixelId` | The pixel the store's pages report to; render it with `trackingHead` |
+| Pages | `pages` | Footer and consent links |
+| Contact | `contact` | The store's phone, email and address, each `null` until the merchant writes it |
+| WhatsApp | `whatsapp` | The WhatsApp button App; read it through `whatsAppContact` |
+| Theme | `themeSettings`, `contentOverrides` | Editable themes |
+
+`logo` and `ogImage` are `MediaImage`s, `{ key, url, width, height }`, or
+`null`. Every field above is always present; a field the merchant has not set
+is `null`, `false`, `[]` or `{}`, never missing.
+
+<Callout type="info" title="Colours and fonts are theme settings">
+The config carries no colours, font or announcement bar. Those are the
+theme's own settings: an editable theme declares them in
+`defineTheme({ settings })` and reads them from `themeSettings`.
+</Callout>
+
+## Feature switches
+
+Render a feature only when the store has it:
+
+```astro
+---
+const { cartEnabled, reviewsEnabled, otpEnabled, turnstileSiteKey } = config;
+---
+
+{cartEnabled && <CartDrawer />}
+{reviewsEnabled && <ProductReviews productId={product.id} />}
+{otpEnabled && <OtpStep />}
+{turnstileSiteKey && <div class="cf-turnstile" data-sitekey={turnstileSiteKey} />}
+```
+
+A store with `cartEnabled: false` must ship no cart markup at all. This is not
+cosmetic: the switch is the rollback path for the cart feature.
+
+The same rule applies to reviews, OTP and the WhatsApp button (`whatsapp` is
+`null` when the store has none). Their settings exist so a store can turn the
+surface off without a deploy.
+
+## Checkout policy
+
+`checkoutForm` is the merchant's form policy, already resolved:
+
+```ts
+type CheckoutFormPolicy = {
+  address: "required" | "optional" | "hidden";
+  notes: "optional" | "hidden";
+  email: "required" | "optional" | "hidden";
+  deliveryOptions: { home: boolean; stopDesk: boolean };
+  customFields: Array<{
+    id: string;
+    label: string;
+    type: "text" | "textarea" | "number" | "select";
+    required: boolean;
+    options?: string[];
+  }>;
+};
+```
+
+Read it; do not re-decide it. In particular:
+
+- `hidden` means render no input, not a disabled or empty one.
+- `customFields` are merchant-authored. Render `label` as text, never as HTML.
+- Send answers as `customFieldResponses`, keyed by the field's server-minted
+  `id`.
+- The server validates the same policy on order creation. A client-side
+  shortcut cannot make a required field optional.
+
+```ts
+const answers = config.checkoutForm.customFields.map((field) => ({
+  id: field.id,
+  value: formData.get(`custom:${field.id}`)?.toString() ?? "",
+}));
+```
+
+The order action accepts one JSON field for these answers, so a merchant can add
+a custom field without a theme deploy.
+
+## Languages
+
+A store has a primary language (`lang`) and a list of published languages
+(`locales`):
+
+```ts
+const config = await createStore().config.get();
+
+config?.locales;
+// [
+//   { code: "ar", nativeName: "العربية", direction: "rtl" },
+//   { code: "fr", nativeName: "français", direction: "ltr" },
+// ]
+```
+
+`locales` is ordered with the primary first. It is the only authority on which
+languages exist; do not hardcode a language list in your theme.
+
+`servedLanguage(config, code)` gives the language object for `<html lang>` and
+`dir`:
+
+```astro
+---
+import { servedLanguage } from "@wocart/storefront";
+
+const language = servedLanguage(config, config.locale);
+---
+<html lang={config.locale} dir={language?.direction ?? "ltr"}>
+```
+
+### URL shape
+
+The primary language has no prefix. Every other published language has one:
+
+```text
+/products/robe          primary (Arabic, for example)
+/fr/products/robe       French
+/ar/products/robe       301 to /products/robe
+/fr/lp/summer           301 to /lp/summer (a landing page has one language)
+```
+
+The helpers that implement this are pure:
+
+```ts
+import {
+  alternateLinks,
+  localeRouting,
+  localizeHref,
+  resolveLocalePath,
+} from "@wocart/storefront";
+
+const routing = localeRouting(config);
+
+resolveLocalePath("/fr/products/robe", routing);
+// { kind: "page", locale: "fr", pathname: "/products/robe" }
+
+localizeHref("/products/robe", "fr", routing);
+// "/fr/products/robe"
+
+alternateLinks("/products/robe", routing, "https://shop.example");
+// hreflang entries, primary first, plus x-default
+```
+
+`resolveLocalePath` only treats a first segment as a language when the store
+publishes it. An unknown prefix is an ordinary path and 404s normally.
+
+A landing page exists in the primary language only: it is one campaign,
+written once for the ads that point at it. `SINGLE_LANGUAGE_PAGE_TYPES`
+(`["landing"]`) names such page types and `isSingleLanguagePage(pathname)`
+tells one from any other page. `resolveLocalePath` redirects any prefix on
+it, `localizeHref` leaves its links unprefixed, and `alternateLinks` returns
+no alternates for it. A language menu should list no languages there.
+
+### One request, one language
+
+`resolveStoreRequest` from `@wocart/storefront/astro` applies the whole
+language policy for a request: which store config, which language, which
+client, and whether to redirect. `createStorefrontMiddleware` calls it for
+every page, so a theme's middleware is one call
+([Astro integration](/sdk/storefront/astro#request-bound-services)):
+
+```ts
+// src/middleware.ts
+import { getActionContext } from "astro:actions";
+import { COD_SERVER_URL, WOCART_PREVIEW_KEY } from "astro:env/server";
+import { unavailableStoreConfig } from "@wocart/storefront";
+import { createStorefrontMiddleware } from "@wocart/storefront/astro";
+import { THEME_PREVIEW_PATH } from "@wocart/theme";
+import { createStore } from "./lib/store";
+
+export const onRequest = createStorefrontMiddleware({
+  client: createStore,
+  fallback: unavailableStoreConfig({ serverUrl: COD_SERVER_URL ?? "", locale: "ar" }),
+  preview: { path: THEME_PREVIEW_PATH, publicKey: () => WOCART_PREVIEW_KEY, theme: "my-theme" },
+  context: (store) => store, // client, config, locale, routing, pathname
+  getActionContext,
+});
+```
+
+| What it decides | How |
+| --- | --- |
+| The language | From the path's first segment when the store publishes it (`/fr/…`); else the primary |
+| The primary's own prefix | `/ar/x` on an Arabic-primary store redirects **301** to `/x` |
+| A landing page under a prefix | `/fr/lp/x?fbclid=…` redirects **301** to `/lp/x?fbclid=…`, the query kept |
+| A language the store stopped publishing | Redirects **302** to the primary page — it may come back |
+| The route to render | `rewrite: "/products/robe"` for `/fr/products/robe`, so one route file serves every language |
+| The client | `client(locale)` for a non-primary language, `client()` for the primary — one client per language, each with its own caches |
+| An endpoint or server island | `/api/…` and `/_server-islands/…` take the language of the page that asked (its same-origin `Referer`), and are never redirected |
+| A rewrite to `/404` | `createStorefrontMiddleware` keeps the store the request already has, so the 404 is in the shopper's language |
+| An unreadable config | `fallback` renders instead |
+
+`config.locale` is the language that actually arrived. A page's links go
+through `localizeHref(path, locale, routing)`; `ResolvedStore.pathname` is the
+path without its prefix, which is what `matchStorefrontPath` and
+`showsWidgetOn` expect. The [theme quick start](/sdk/theme/build#7-the-requests-store)
+builds a full request store on top of this, including the theme's text.
+
+`unavailableStoreConfig({ serverUrl, locale })` is the fallback: an empty
+`id`, nothing to buy (no cart, checkout delivery options, OTP, Turnstile,
+reviews or WhatsApp), `locale` as its only language, and images served
+directly from `<serverUrl>/media`. Never write a fallback config by hand; the
+[theme quick start](/sdk/theme/build#5-the-store-that-cannot-be-read) shows it
+in a full project.
+
+If you need the pieces without the policy, they are pure functions:
+`localeRouting(config)` → `{ primary, published }`,
+`resolveLocalePath(pathname, routing)` → a page or a redirect, and
+`localizeHref(href, locale, routing)`.
+
+### Links and alternates
+
+Every internal link should go through `localizeHref`, including links returned
+by menus:
+
+```astro
+<a href={localizeHref(item.href, config.locale, routing)}>{item.label}</a>
+```
+
+In the head, emit one alternate per published language. Pass the page's path
+**without** its language prefix (`ResolvedStore.pathname`): on `/fr/x`,
+`Astro.url.pathname` is `/fr/x`, and every alternate would point at the
+French page.
+
+```astro
+---
+const { pathname, routing } = Astro.locals.store;
+const alternates = alternateLinks(pathname, routing, Astro.url.origin);
+---
+{alternates.map((link) => (
+  <link rel="alternate" hreflang={link.hreflang} href={link.href} />
+))}
+```
+
+## Theme text and settings
+
+Two fields only hold data when the client is created with a theme key:
+
+```ts
+const store = createStoreClient({
+  serverUrl,
+  apiKey,
+  theme: "my-theme",
+});
+
+const config = await store.config.get();
+config?.contentOverrides;
+// { ar: { heroTitle: "..." }, fr: { heroTitle: "..." } }
+config?.themeSettings;
+// { pageScheme: "light", colorSchemes: [ … ] }
+```
+
+- `contentOverrides[locale]` is the merchant's edits to your theme's text in
+  that language. Merge only that language's map over your own copy.
+- `themeSettings` is the merchant's saved values, exactly as stored. In an
+  editable theme, resolve them against the theme declaration with
+  `resolveThemeSettings` from `@wocart/theme`.
+- Without `theme`, both are empty/absent. A plain custom storefront can ignore
+  them and use its own copy and styling.
+
+Read [Theme SDK](/sdk/theme) if you are building an editable theme.
+
+## Pages and contact details
+
+`config.pages` lists the published pages that opted into the footer, titled
+in `locale` and in display order:
+
+```ts
+import { storefrontPath } from "@wocart/storefront";
+
+config.pages.map((page) => ({
+  title: page.title,
+  href: storefrontPath("page", { slug: page.slug }),
+  kind: page.kind, // terms | privacy | refund | shipping | custom
+}));
+```
+
+Use `kind` when the rule names a page: "you agree to the Terms" means the
+`terms` kind, not a hardcoded `/pages/terms` slug. A merchant may rename a
+slug. Build the link with `storefrontPath`, then localize it with
+`localizeHref`.
+
+`config.contact` is how a shopper reaches the store, besides WhatsApp:
+
+```ts
+config.contact;
+// { phone: "0555 12 34 56", email: "help@shop.example", address: null }
+```
+
+Each value is `null` until the merchant writes it. Show each one only once it
+is set, and never write a store fact in your theme's own words: a phone
+number, an address, opening hours or a delivery promise is true of one store
+and false of the next. Delivery times belong to the store's own pages (its
+`shipping` page), not to the config.
+
+## WhatsApp
+
+`config.whatsapp` is the WhatsApp button App's settings, or `null` when the
+store has none. Each of its texts arrives in the page's language, or `null`
+where the merchant wrote none in that language. Never read it field by field:
+`whatsAppContact(config, page, words)` resolves the link, the message and
+every text, with your theme's words where the merchant left one empty.
+
+```ts
+import { showsWidgetOn, whatsAppContact } from "@wocart/storefront";
+
+const { config, pathname } = Astro.locals.store; // pathname without its language prefix
+const contact = whatsAppContact(config, { kind: "general", url: Astro.url.href }, words);
+
+if (contact && showsWidgetOn(contact.surfaces, pathname)) {
+  // Render the floating launcher.
+}
+```
+
+`showsWidgetOn(surfaces, pathname)` decides only the floating launcher: a
+WhatsApp link elsewhere on the page (a footer, a contact card, an order
+button) does not depend on it. Pass the path **without** its language prefix:
+`/fr/products/robe` is not a storefront path, `/products/robe` is.
+
+| Switch | Pages |
+| --- | --- |
+| `home` | The home page |
+| `catalog` | All products, categories, collections |
+| `product` | Product pages |
+| `pages` | Store pages, order tracking, search and contact |
+| `thankYou` | The order confirmation |
+| `checkout` | The basket checkout |
+| `landing` | Landing pages |
+
+Any other path shows no launcher. `words` and the message rules are covered
+in [Money, images, WhatsApp and Meta events](/sdk/storefront/presentation#whatsapp).

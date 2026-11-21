@@ -1,0 +1,16 @@
+---
+import DashboardLayout from "@/layouts/DashboardLayout.astro";
+import { PageSkeleton } from "@/components/layout/PageSkeleton";
+import OrdersPageApp from "@/features/orders/components/OrdersPageApp";
+
+// Static shell ships NOTHING of the gated UI: the page skeleton plus a
+// [hidden] region that RequireAuth reveals after the session verdict.
+---
+
+<DashboardLayout>
+  <PageSkeleton gate="required" />
+
+  <div data-auth-gate="required" hidden>
+    <OrdersPageApp client:only="react" />
+  </div>
+</DashboardLayout>

@@ -1,0 +1,331 @@
+/**
+ * The published OpenAPI document is what the API answers, on real D1: an
+ * order's life from creation to its settled delivery — through a carrier and
+ * through the store's driver — goes through the real routes, and every
+ * answer must match the document strictly (a field it does not declare is
+ * drift too). And no answer, nor the document, carries a credential.
+ */
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
+import { signIn } from "@/test-utils/sign-in";
+import { OpenAPIHono } from "@hono/zod-openapi";
+import { eq } from "drizzle-orm";
+import type { AppContext } from "@/types";
+import { createTestD1, type TestD1 } from "@/test-utils/d1";
+import { responseErrors, type OpenApiDocument } from "@/test-utils/openapi-contract";
+import * as schema from "@/db/schema";
+import { errorHandler } from "@/middleware/error";
+import { openApiValidationHook } from "@/openapi/validation-hook";
+import { createEcotrackMockServer, type EcotrackMockServer } from "@/carriers/ecotrack/test/mock-server";
+import { yalidineCapabilities } from "@/carriers/yalidine/adapter";
+import { NOEST_CAPABILITIES } from "@/carriers/noest/adapter";
+import { ECOTRACK_CAPABILITIES } from "@/carriers/ecotrack/adapter";
+import { registerSpecEndpoint } from "./serve";
+import ordersRouter from "@/endpoints/orders/routes";
+import shipmentsRouter from "@/endpoints/shipments/routes";
+import deliveryCompaniesRouter from "@/endpoints/delivery-companies/routes";
+import driversRouter from "@/endpoints/drivers/routes";
+import driverPaymentsRouter from "@/endpoints/driver-payments/routes";
+import analyticsRouter from "@/endpoints/analytics/routes";
+import eventsRouter from "@/endpoints/events/routes";
+import eventConsumersRouter from "@/endpoints/event-consumers/routes";
+import eventDeliveriesRouter from "@/endpoints/event-deliveries/routes";
+import telegramAppRouter from "@/endpoints/apps/telegram";
+import webhooksRouter from "@/endpoints/webhooks/routes";
+import { TELEGRAM_SECRET_HEADER } from "@/endpoints/webhooks/telegram";
+import { seedOrder, seedStore, T0, type OrderSeed } from "@/endpoints/shipments/test/harness";
+
+const dbModule = vi.hoisted(() => ({ getDb: vi.fn() }));
+vi.mock("@/db", () => dbModule);
+
+const WEBHOOK_SECRET = "whsec_contract_signing_secret_9f2c";
+const STORED_SECRET = "stored-secret-7d41";
+
+let d1: TestD1;
+let app: OpenAPIHono<AppContext>;
+let doc: OpenApiDocument;
+let server: EcotrackMockServer;
+let commune16: string;
+const realFetch = globalThis.fetch;
+/** Every body the API answered in a test, to search for credentials. */
+let answered: string[] = [];
+
+beforeAll(async () => {
+  d1 = await createTestD1();
+  app = new OpenAPIHono<AppContext>({ defaultHook: openApiValidationHook });
+  registerSpecEndpoint(app);
+  app.use("/api/*", async (c, next) => {
+    c.env = { DB: d1.raw, WORKER_SELF_URL: "https://api.example.com/" } as never;
+    signIn(c, { id: "staff_1", email: "s@example.com", name: "Staff", role: "admin", status: "active", apiKey: "k", scopes: ["*"] } as never);
+    await next();
+  });
+  app.use("/webhooks/*", async (c, next) => {
+    c.env = { DB: d1.raw } as never;
+    await next();
+  });
+  app.onError(errorHandler);
+  app.route("/api/orders", ordersRouter);
+  app.route("/api/shipments", shipmentsRouter);
+  app.route("/api/delivery-companies", deliveryCompaniesRouter);
+  app.route("/api/drivers", driversRouter);
+  app.route("/api/driver-payments", driverPaymentsRouter);
+  app.route("/api/analytics", analyticsRouter);
+  app.route("/api/events", eventsRouter);
+  app.route("/api/event-consumers", eventConsumersRouter);
+  app.route("/api/event-deliveries", eventDeliveriesRouter);
+  app.route("/api/apps", telegramAppRouter);
+  app.route("/webhooks", webhooksRouter);
+  doc = (await (await app.request("/api/openapi.json", {}, { WORKER_URL: "https://api.example.com" } as never)).json()) as OpenApiDocument;
+}, 120_000);
+
+afterAll(async () => {
+  await d1?.dispose();
+});
+
+beforeEach(async () => {
+  dbModule.getDb.mockReturnValue(d1.db);
+  answered = [];
+  server = createEcotrackMockServer();
+  globalThis.fetch = ((url: string | URL, init?: RequestInit) => server.fetch(url, init)) as typeof fetch;
+  commune16 = await seedStore(d1.db, server);
+  await d1.db.update(schema.deliveryCompanies).set({ webhookSecret: WEBHOOK_SECRET, providerConfig: JSON.stringify({ platform: "yalidine", apiSecret: STORED_SECRET }) }).where(eq(schema.deliveryCompanies.id, "yal"));
+  await d1.db.insert(schema.drivers).values({ id: "dr1", firstName: "Amine", lastName: "B", phone: "0661111111", createdAt: T0, updatedAt: T0 });
+  await d1.db.insert(schema.driverCompensations).values({ id: "comp1", driverId: "dr1", wilayaId: 16, feePerDelivery: 300, createdAt: T0, updatedAt: T0 });
+});
+
+afterEach(() => {
+  globalThis.fetch = realFetch;
+});
+
+const seed = (s: OrderSeed) => seedOrder(d1.db, commune16, s);
+
+/**
+ * One request through the app; its answer must have the expected status and
+ * match the document's schema for `template` (the path as documented).
+ */
+async function api(method: string, path: string, template: string, status: number, body?: unknown) {
+  const init = { method, ...(body !== undefined ? { body: JSON.stringify(body), headers: { "Content-Type": "application/json" } } : {}) };
+  const res = await app.request(path, init, undefined, { waitUntil: () => {}, passThroughOnException: () => {}, props: {} } as never);
+  const text = await res.text();
+  answered.push(text);
+  expect(res.status, `${method} ${path}: ${text.slice(0, 400)}`).toBe(status);
+  const json = JSON.parse(text);
+  expect(responseErrors(doc, method, template, status, json), `${method} ${template} ${status}`).toEqual([]);
+  return json;
+}
+
+describe("the document is what the API answers", () => {
+  it("an order handed to a carrier, followed, voided, handed again", async () => {
+    await seed({ id: "o1", status: "confirmed" });
+    await api("GET", "/api/orders", "/api/orders", 200);
+    await api("GET", "/api/orders/o1", "/api/orders/{id}", 200);
+    await api("PATCH", "/api/orders/o1/status", "/api/orders/{id}/status", 200, { status: "ready" });
+
+    const handed = await api("POST", "/api/orders/o1/shipment", "/api/orders/{id}/shipment", 201, { kind: "carrier", companyId: "eco-manual" });
+    const shipmentId = handed.data.shipment.id;
+    await api("GET", `/api/shipments/${shipmentId}`, "/api/shipments/{id}", 200);
+    await api("GET", "/api/orders/o1", "/api/orders/{id}", 200);
+    await api("GET", "/api/orders?stage=ready_to_ship", "/api/orders", 200);
+    await api("POST", `/api/shipments/${shipmentId}/sync`, "/api/shipments/{id}/sync", 200);
+    await api("POST", `/api/shipments/${shipmentId}/void`, "/api/shipments/{id}/void", 200);
+    const again = await api("POST", "/api/orders/o1/shipment", "/api/orders/{id}/shipment", 201, { kind: "carrier", companyId: "eco-manual" });
+    await api("POST", `/api/shipments/${again.data.shipment.id}/validate`, "/api/shipments/{id}/validate", 200, {});
+    await api("POST", "/api/orders/o1/shipment", "/api/orders/{id}/shipment", 409, { kind: "carrier", companyId: "eco" });
+    const newest = await api("GET", "/api/events?orderId=o1", "/api/events", 200);
+    expect(newest.data.map((event: { type: string }) => event.type)).toEqual(expect.arrayContaining(["order.ready", "shipment.handed_off", "shipment.voided"]));
+  });
+
+  it("a carrier that does not confirm, then resolved", async () => {
+    await seed({ id: "o1" });
+    server.override("/api/v1/create/order", () => new Response("{}", { status: 500 }));
+    const unknown = await api("POST", "/api/orders/o1/shipment", "/api/orders/{id}/shipment", 202, { kind: "carrier", companyId: "eco" });
+    server.restore("/api/v1/create/order");
+    await api("POST", `/api/shipments/${unknown.data.shipment.id}/resolve`, "/api/shipments/{id}/resolve", 200, { action: "release" });
+  });
+
+  it("many orders at once, to a carrier and to the driver", async () => {
+    for (const id of ["o1", "o2", "o3", "o4"]) await seed({ id });
+    await api("POST", "/api/shipments/bulk", "/api/shipments/bulk", 200, { companyId: "eco", orderIds: ["o1", "o2", "missing"] });
+    await api("POST", "/api/shipments/driver-bulk", "/api/shipments/driver-bulk", 200, { driverId: "dr1", orderIds: ["o3", "o4", "o1"] });
+  });
+
+  it("the driver's delivery, its settlement, the driver and the counts", async () => {
+    await seed({ id: "o1" });
+    const handed = await api("POST", "/api/orders/o1/shipment", "/api/orders/{id}/shipment", 201, { kind: "driver", driverId: "dr1" });
+    const shipmentId = handed.data.shipment.id;
+    await api("POST", `/api/shipments/${shipmentId}/events`, "/api/shipments/{id}/events", 200, { status: "out_for_delivery" });
+    await api("POST", `/api/shipments/${shipmentId}/events`, "/api/shipments/{id}/events", 200, { status: "delivered" });
+    await api("GET", "/api/orders/o1", "/api/orders/{id}", 200);
+    await api("GET", "/api/driver-payments/dr1/pending", "/api/driver-payments/{driverId}/pending", 200);
+    await api("POST", "/api/driver-payments", "/api/driver-payments", 201, { driverId: "dr1", type: "net_settlement", shipmentIds: [shipmentId] });
+    await api("POST", "/api/driver-payments", "/api/driver-payments", 422, { driverId: "dr1", type: "cod_remittance", shipmentIds: [shipmentId] });
+    await api("GET", "/api/driver-payments/dr1", "/api/driver-payments/{driverId}", 200);
+    await api("GET", "/api/drivers/dr1", "/api/drivers/{id}", 200);
+    await api("GET", "/api/analytics/order-stages", "/api/analytics/order-stages", 200);
+    const log = await api("GET", "/api/events?orderId=o1&after=0", "/api/events", 200);
+    expect(log.data.map((event: { type: string }) => event.type)).toEqual(["shipment.handed_off", "shipment.out_for_delivery", "shipment.delivered"]);
+    await api("GET", `/api/events/${log.data[2].id}`, "/api/events/{id}", 200);
+    await api("GET", "/api/events/evt_missing", "/api/events/{id}", 404);
+    await api("GET", "/api/events?type=order.everything", "/api/events", 400);
+  });
+
+  it("the Consumers, a Replay to one, and its Deliveries", async () => {
+    await seed({ id: "o1", status: "new" });
+    await api("PATCH", "/api/orders/o1/status", "/api/orders/{id}/status", 200, { status: "confirmed" });
+    const consumers = await api("GET", "/api/event-consumers", "/api/event-consumers", 200);
+    expect(consumers.data.map((c: { id: string }) => c.id)).toContain("meta-conversions");
+    await api("GET", "/api/event-consumers/meta-conversions", "/api/event-consumers/{id}", 200);
+    await api("PATCH", "/api/event-consumers/meta-conversions", "/api/event-consumers/{id}", 200, { enabled: false });
+    await api("POST", "/api/event-consumers/meta-conversions/replay", "/api/event-consumers/{id}/replay", 409, { fromSequence: 1, toSequence: 10 });
+    await api("PATCH", "/api/event-consumers/meta-conversions", "/api/event-consumers/{id}", 200, { enabled: true });
+    await api("POST", "/api/event-consumers/meta-conversions/replay", "/api/event-consumers/{id}/replay", 400, { fromSequence: 5, toSequence: 1 });
+    const replay = await api("POST", "/api/event-consumers/meta-conversions/replay", "/api/event-consumers/{id}/replay", 202, { fromSequence: 1, toSequence: 1000 });
+    expect(replay.data.created).toBeGreaterThan(0);
+    const listed = await api("GET", "/api/event-deliveries?consumerId=meta-conversions", "/api/event-deliveries", 200);
+    await api("GET", `/api/event-deliveries?eventId=${listed.data[0].event.id}`, "/api/event-deliveries", 200);
+    await api("GET", `/api/event-deliveries/${listed.data[0].id}`, "/api/event-deliveries/{id}", 200);
+    await api("POST", `/api/event-deliveries/${listed.data[0].id}/retry`, "/api/event-deliveries/{id}/retry", 409);
+    await api("GET", "/api/event-deliveries", "/api/event-deliveries", 400);
+    await api("GET", "/api/event-consumers/ghost", "/api/event-consumers/{id}", 404);
+    await api("GET", "/api/event-deliveries/ghost", "/api/event-deliveries/{id}", 404);
+  });
+
+  it("a webhook added, edited, tested, rotated and deleted — its secret in no answer but the two that issue it", async () => {
+    globalThis.fetch = (async () => new Response('{"received":true}', { status: 200 })) as typeof fetch;
+    const hook = { kind: "webhook", name: "ERP", url: "https://erp.example.dz/hooks", subscription: ["order.*"] };
+    const created = await api("POST", "/api/event-consumers", "/api/event-consumers", 201, hook);
+    const id = created.data.consumer.id;
+    await api("POST", "/api/event-consumers", "/api/event-consumers", 400, { ...hook, url: "https://127.0.0.1/" });
+    await api("GET", `/api/event-consumers/${id}`, "/api/event-consumers/{id}", 200);
+    await api("PATCH", `/api/event-consumers/${id}`, "/api/event-consumers/{id}", 200, { name: "ERP 2", subscription: ["*"] });
+    await api("PATCH", "/api/event-consumers/meta-conversions", "/api/event-consumers/{id}", 409, { name: "Mine" });
+    const test = await api("POST", `/api/event-consumers/${id}/test`, "/api/event-consumers/{id}/test", 200, { type: "shipment.delivered" });
+    expect(test.data.outcome).toBe("delivered");
+    await api("POST", `/api/event-consumers/${id}/test`, "/api/event-consumers/{id}/test", 400, { type: "order.shipped" });
+    await api("POST", "/api/event-consumers/meta-conversions/test", "/api/event-consumers/{id}/test", 409, {});
+    const rotated = await api("POST", `/api/event-consumers/${id}/rotate-secret`, "/api/event-consumers/{id}/rotate-secret", 200);
+    await api("POST", "/api/event-consumers/ghost/rotate-secret", "/api/event-consumers/{id}/rotate-secret", 404);
+    const listed = await api("GET", "/api/event-consumers", "/api/event-consumers", 200);
+    expect(listed.data.find((c: { id: string }) => c.id === id).webhook.previousSecretSignsUntil).toBe(rotated.data.previousSecretSignsUntil);
+    await api("DELETE", "/api/event-consumers/meta-conversions", "/api/event-consumers/{id}", 409);
+    await api("DELETE", `/api/event-consumers/${id}`, "/api/event-consumers/{id}", 200);
+    await api("DELETE", `/api/event-consumers/${id}`, "/api/event-consumers/{id}", 404);
+
+    const secrets = [created.data.signingSecret, rotated.data.signingSecret].map((secret: string) => secret.slice("whsec_".length, -4));
+    const holding = answered.filter((text) => secrets.some((secret) => text.includes(secret)));
+    expect(holding).toEqual([JSON.stringify(created), JSON.stringify(rotated)]);
+  });
+
+  it("the Telegram App saved, connected, tested, changed and removed — its token in no answer", async () => {
+    const token = "987654321:AAcontract-test-token-not-a-real-bot";
+    globalThis.fetch = (async (url: string | URL) => {
+      const method = String(url).split("/").at(-1);
+      if (method === "getMe") return Response.json({ ok: true, result: { id: 987654321, is_bot: true, first_name: "Acme", username: "acme_orders_bot" } });
+      if (method === "sendMessage") return Response.json({ ok: false, error_code: 403, description: "Forbidden: bot was blocked by the user" }, { status: 403 });
+      return Response.json({ ok: true, result: true });
+    }) as typeof fetch;
+    expect((await api("GET", "/api/apps/telegram", "/api/apps/telegram", 200)).data).toBeNull();
+    await api("PUT", "/api/apps/telegram/bot", "/api/apps/telegram/bot", 400, { token: "nope" });
+    await api("POST", "/api/apps/telegram/pairing", "/api/apps/telegram/pairing", 409);
+    const saved = await api("PUT", "/api/apps/telegram/bot", "/api/apps/telegram/bot", 200, { token });
+    await api("POST", "/api/apps/telegram/test", "/api/apps/telegram/test", 409);
+    const link = await api("POST", "/api/apps/telegram/pairing", "/api/apps/telegram/pairing", 200);
+
+    const secret = (await d1.db.select().from(schema.storeTelegramConfig).get())!.webhookSecret;
+    const update = async (secretHeader: string, body: unknown, status: number) => {
+      const res = await app.request(`/webhooks/telegram/${saved.data.consumerId}`, { method: "POST", headers: { "Content-Type": "application/json", [TELEGRAM_SECRET_HEADER]: secretHeader }, body: JSON.stringify(body) });
+      const json = await res.json();
+      expect(res.status).toBe(status);
+      expect(responseErrors(doc, "POST", "/webhooks/telegram/{consumerId}", status, json)).toEqual([]);
+    };
+    await update("wrong", {}, 401);
+    await update(secret, { update_id: 1, message: { chat: { id: 4242, type: "private", first_name: "Amina" }, text: `/start ${new URL(link.data.url).searchParams.get("start")}` } }, 200);
+    await update(secret, { update_id: 2, message: { chat: { id: 4242, type: "private" }, text: "hi" } }, 200);
+
+    expect((await api("POST", "/api/apps/telegram/test", "/api/apps/telegram/test", 200)).data.reason).toBe("blocked");
+    await api("PATCH", "/api/apps/telegram", "/api/apps/telegram", 200, { events: ["order.created"], language: "en", enabled: false });
+    await api("PATCH", "/api/apps/telegram", "/api/apps/telegram", 400, { events: [] });
+    await api("GET", "/api/apps/telegram", "/api/apps/telegram", 200);
+    await api("DELETE", "/api/apps/telegram", "/api/apps/telegram", 200);
+    await api("PATCH", "/api/apps/telegram", "/api/apps/telegram", 409, { enabled: true });
+    expect(answered.filter((text) => text.includes(token.split(":")[1]!))).toEqual([]);
+  });
+
+  it("the delivery companies, what their carriers can do, their settings and their inbox", async () => {
+    const list = (await api("GET", "/api/delivery-companies", "/api/delivery-companies", 200)).data;
+    const capabilities = (id: string) => list.find((c: any) => c.id === id).capabilities;
+    expect(capabilities("yal")).toEqual(yalidineCapabilities("yalidine"));
+    expect(capabilities("noest")).toEqual(NOEST_CAPABILITIES);
+    expect(capabilities("eco")).toEqual(ECOTRACK_CAPABILITIES);
+    await api("GET", "/api/delivery-companies/yal", "/api/delivery-companies/{id}", 200);
+    const created = await api("POST", "/api/delivery-companies", "/api/delivery-companies", 201, {
+      name: "Guepex", nameAr: "-", code: "guepex", provider: "yalidine", apiToken: "guepex-token-1234", apiUserGuid: "guepex-id-5678",
+      providerConfig: { platform: "guepex" },
+    });
+    expect(created.data.capabilities).toEqual(yalidineCapabilities("guepex"));
+    await api("PATCH", `/api/delivery-companies/${created.data.id}`, "/api/delivery-companies/{id}", 200, { apiToken: "guepex-token-9999" });
+    await api("GET", "/api/delivery-companies/yal/webhook/events", "/api/delivery-companies/{id}/webhook/events", 200);
+  });
+});
+
+describe("no credential leaves the server", () => {
+  const credentials = [WEBHOOK_SECRET, STORED_SECRET, "yal-token", "yal-id", "zr-key", "noest-token", "noest-guid", "guepex-token-1234", "guepex-token-9999", "guepex-id-5678"];
+
+  it("in any answer about the companies", async () => {
+    await api("GET", "/api/delivery-companies", "/api/delivery-companies", 200);
+    await api("GET", "/api/delivery-companies/yal", "/api/delivery-companies/{id}", 200);
+    const created = await api("POST", "/api/delivery-companies", "/api/delivery-companies", 201, {
+      name: "Guepex", nameAr: "-", code: "guepex", provider: "yalidine", apiToken: "guepex-token-1234", apiUserGuid: "guepex-id-5678",
+      providerConfig: { platform: "guepex" },
+    });
+    await api("PATCH", `/api/delivery-companies/${created.data.id}`, "/api/delivery-companies/{id}", 200, { apiToken: "guepex-token-9999" });
+    const all = answered.join("\n");
+    for (const secret of [...credentials, server.token]) expect(all, secret).not.toContain(secret);
+    const yal = (await api("GET", "/api/delivery-companies/yal", "/api/delivery-companies/{id}", 200)).data;
+    expect(yal).toMatchObject({ isConnected: true, webhookSecretSet: true });
+    expect(yal.providerConfig.apiSecret).toBe(`••••${STORED_SECRET.slice(-4)}`);
+    expect((await api("GET", "/api/delivery-companies/zr", "/api/delivery-companies/{id}", 200)).data.webhookSecretSet).toBe(false);
+  });
+
+  it("nor does the document describe one: a response field named like a credential is a yes/no, a time, or says what it holds", () => {
+    const credentialName = /secret|token|password|api.?key|guid/i;
+    const found: string[] = [];
+    const issuedBy = new Set<string>();
+    /** `x-credential: masked` shows how it is masked; `issued` is the one answer that makes it, a POST's. */
+    const check = (key: string, value: any, at: string, method: string | null) => {
+      if (!credentialName.test(key) || value.type === "boolean" || value.format === "date-time") return;
+      const declared = value["x-credential"];
+      if (declared === "masked" && String(value.example ?? "").startsWith("••••")) return;
+      if (declared === "issued") {
+        if (method === null || method === "post") {
+          if (method) issuedBy.add(at);
+          return;
+        }
+      }
+      found.push(`${at}.${key}`);
+    };
+    const visit = (node: any, at: string, method: string | null, seen = new Set<string>()) => {
+      if (!node || typeof node !== "object") return;
+      if (typeof node.$ref === "string") {
+        if (method === null || seen.has(node.$ref)) return;
+        seen.add(node.$ref);
+        return visit(doc.components?.schemas?.[node.$ref.split("/").at(-1)!], at, method, seen);
+      }
+      if (node.properties) {
+        for (const [key, value] of Object.entries<any>(node.properties)) {
+          check(key, value, `${at}.${key}`, method);
+          visit(value, `${at}.${key}`, method, seen);
+        }
+      }
+      for (const key of ["items", "additionalProperties"]) visit(node[key], at, method, seen);
+      for (const key of ["anyOf", "oneOf", "allOf"]) (node[key] ?? []).forEach((s: unknown) => visit(s, at, method, seen));
+    };
+    for (const [path, operations] of Object.entries(doc.paths)) {
+      for (const [method, operation] of Object.entries(operations)) {
+        for (const [status, response] of Object.entries(operation.responses ?? {})) visit(response.content?.["application/json"]?.schema, `${method.toUpperCase()} ${path} ${status}`, method);
+      }
+    }
+    for (const [name, component] of Object.entries(doc.components?.schemas ?? {})) visit(component, name, null);
+    expect(found).toEqual([]);
+    expect([...issuedBy].map((at) => at.replace(/\.data\..*$/, ""))).toEqual(["POST /api/event-consumers 201", "POST /api/event-consumers/{id}/rotate-secret 200"]);
+  });
+});

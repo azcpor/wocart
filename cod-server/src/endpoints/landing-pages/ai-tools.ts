@@ -1,0 +1,805 @@
+import { storefrontPath } from "../../../../cod-shared/storefront/routes";
+import { tool } from "ai";
+import { z } from "zod";
+import * as queries from "./queries";
+import { createLandingPageSchema, updateLandingPageSchema } from "./validation";
+import { getDb } from "@/db";
+import type { Env } from "@/types/env";
+import { mediaDeliveryOf, releaseShown } from "@/lib/media";
+import {
+  addAgentLandingImage,
+  BASE64_MAX_INPUT_LENGTH,
+  decodeBase64Image,
+  IMAGE_CONTENT_TYPES,
+  LandingImageError,
+  type LandingImageSource,
+} from "@/lib/landing-image-upload";
+import { toolOutput } from "@/lib/tool-output-schema";
+import {
+  buildLandingPagePublicUrl,
+  resolveStorefrontBaseUrl,
+} from "../../../../cod-shared/queries/landing-pages";
+import { toolId } from "@/lib/tool-input";
+
+/**
+ * Layer-2 validation schemas, hoisted to module level and exported so the MCP
+ * layer (src/mcp/schemas.ts) can derive tools/list inputSchema from the exact
+ * same definitions — the advertised schema and the executed validation cannot
+ * drift apart.
+ *
+ * Every schema is STRICT: an unknown field is an explicit, recoverable
+ * validation error — never a silently stripped key.
+ */
+export const listLandingPagesSchema = z.strictObject({
+  productId: z.string().optional().describe("Filter by product ID"),
+  status: z.enum(["draft", "published", "archived"]).optional().describe("Filter by lifecycle status"),
+  limit: z
+    .number()
+    .int()
+    .min(1)
+    .max(200)
+    .default(50)
+    .describe("Page size (1-200, default 50). Rows are newest-first; page through with offset when the result hits the limit."),
+  offset: z
+    .number()
+    .int()
+    .min(0)
+    .default(0)
+    .describe("Number of rows to skip — pair with limit for paging through large catalogs."),
+});
+export const getLandingPageDetailsSchema = z.strictObject({
+  landingPageId: toolId().describe("The ID of the landing page to retrieve"),
+});
+export const createLandingPageToolSchema = createLandingPageSchema.strict();
+export const updateLandingPageToolSchema = z.strictObject({
+  landingPageId: toolId().describe("The ID of the landing page to update"),
+  updates: updateLandingPageSchema.strict(),
+});
+export const publishLandingPageSchema = z.strictObject({
+  landingPageId: toolId().describe("The ID of the landing page to publish"),
+});
+export const deleteLandingPageSchema = z.strictObject({
+  landingPageId: toolId().describe("The ID of the landing page to delete"),
+});
+
+/** ChatGPT file-object input (openai/fileParams contract): the CLIENT fills
+ *  this object — download_url + file_id required, mime_type/file_name optional.
+ *  The model never touches image bytes. */
+const chatgptFileObjectSchema = z.strictObject({
+  download_url: z
+    .string()
+    .min(1)
+    .describe("Direct fetchable URL of the image — filled in by the client, not the model"),
+  file_id: z
+    .string()
+    .min(1)
+    .describe("Client-side file identifier — filled in by the client, not the model"),
+  mime_type: z.string().optional().describe("MIME type of the image, when the client knows it"),
+  file_name: z.string().optional().describe("File name, when the client knows it"),
+});
+
+export const uploadLandingPageImageSchema = z
+  .strictObject({
+    landingPageId: toolId()
+      .describe("The ID of the landing page that receives the image"),
+    image: chatgptFileObjectSchema
+      .optional()
+      .describe(
+        "PREFERRED from ChatGPT and other chat clients: the conversation image as a file object. " +
+          "The client fills download_url automatically — pass the generated image here; do NOT inline image data.",
+      ),
+    imageUrl: z
+      .url({ protocol: /^https?$/, message: "imageUrl must be an http(s) URL" })
+      .optional()
+      .describe(
+        "A directly-fetchable public http(s) URL of the image — e.g. the download URL of an image you generated. " +
+          "Login-protected or expired links fail with a 'not publicly fetchable' error; if so, re-generate or re-host the image and retry with a fresh URL.",
+      ),
+    imageBase64: z
+      .string()
+      .max(BASE64_MAX_INPUT_LENGTH)
+      .optional()
+      .describe(
+        "Programmatic clients ONLY (API/agent harnesses that construct this call in code). " +
+          "NEVER use from a chat client: inline image data is blocked by client safety checks before the call is sent, " +
+          "and raw bytes, base64-encoded (max 8 MB decoded), cannot be emitted as tool arguments anyway.",
+      ),
+    contentType: z
+      .enum(IMAGE_CONTENT_TYPES)
+      .describe(
+        "MIME type of the actual image bytes: image/png, image/jpeg, image/webp, or image/gif. " +
+          "ChatGPT image generation outputs PNG. Verified server-side by magic-byte sniffing — a mismatch is rejected.",
+      ),
+    altText: z.string().max(1000).optional().describe("Alt text for accessibility"),
+    position: z
+      .number()
+      .int()
+      .min(1)
+      .optional()
+      .describe("Stack position, 1 = top of the page. Omit to append at the end of the stack."),
+  })
+  .refine(
+    (data) =>
+      [data.image, data.imageUrl, data.imageBase64].filter((v) => v !== undefined).length === 1,
+    {
+      message:
+        "Provide exactly one of image (chat clients — the file object), imageUrl (a public URL), or imageBase64 (programmatic clients only).",
+    },
+  );
+
+/**
+ * ChatGPT tool-descriptor `_meta` extensions for this domain. Merged by
+ * src/mcp/schemas.ts into TOOL_META and attached at registration time in
+ * server-factory.ts.
+ *
+ * `openai/fileParams` tells the ChatGPT runtime that the named input is a
+ * file object it should construct itself (with a real, fetchable
+ * download_url) — the supported way to pass conversation files to a tool,
+ * because tool-call arguments are model-generated JSON that can never carry
+ * image bytes.
+ *
+ * `openai/toolInvocation` status text (≤64 chars each) is what ChatGPT shows
+ * while the tool runs and after it completes — the async upload is the one
+ * flow where that feedback matters most.
+ */
+export const LANDING_PAGE_TOOL_META: Record<string, Record<string, unknown>> = {
+  uploadLandingPageImage: {
+    "openai/fileParams": ["image"],
+    "openai/toolInvocation/invoking": "Starting background image upload…",
+    "openai/toolInvocation/invoked": "Upload job created — poll status until complete",
+  },
+};
+
+/** One landing_page_images row — the ordered image stack entry. */
+const lpImageRowSchema = z.looseObject({
+  id: z.string().describe("Image row ID — used by removeLandingPageImage and reorderLandingPageImages"),
+  key: z.string().describe("The image's Media Key (landing/<hex>.<ext>)"),
+  url: z.string().describe("Where browsers fetch the image"),
+  altText: z.string().nullable().describe("Alt text, or null"),
+  position: z.number().int().describe("Stack position — 1 is the top of the page"),
+  width: z.number().int().nullable().describe("Intrinsic pixel width, or null when unmeasured"),
+  height: z.number().int().nullable().describe("Intrinsic pixel height, or null when unmeasured"),
+  source: z.enum(["upload", "ai"]).describe("Provenance: uploaded by a human or generated by an AI agent"),
+});
+
+/** A landing page detail aggregate (the shape getLandingPageById returns). */
+const lpDetailSchema = z.looseObject({
+  id: z.string().describe("Landing page ID"),
+  slug: z.string().describe("Public slug — the page lives at /lp/<slug>"),
+  name: z.string(),
+  status: z.enum(["draft", "published", "archived"]).describe("Lifecycle status"),
+  productId: z.string().describe("The single product this page markets"),
+  imageGap: z.number().int().describe("Gap in pixels between stacked images"),
+  images: z.array(lpImageRowSchema).describe("The ordered image stack — index 0 renders at the top of the page"),
+  product: z
+    .looseObject({
+      id: z.string(),
+      name: z.string(),
+      handle: z.string(),
+      price: z.number().describe("Catalog price charged on this page (server-authoritative)"),
+    })
+    .nullable()
+    .describe("The linked product, or null when it was deleted"),
+});
+
+const lpListItemSchema = z.looseObject({
+  id: z.string().describe("Landing page ID"),
+  slug: z.string().describe("Public slug — the page lives at /lp/<slug>"),
+  name: z.string(),
+  status: z.enum(["draft", "published", "archived"]),
+  productId: z.string(),
+  productName: z.string().nullable(),
+  imageCount: z.number().int().describe("Images in the stack"),
+  publicPath: z.string().describe("Relative public path /lp/<slug>"),
+  publicUrl: z.string().describe("Absolute public URL when a storefront base resolves, else the relative path"),
+});
+
+export const LANDING_PAGE_TOOL_OUTPUT_SCHEMAS: Record<string, z.ZodType> = {
+  listLandingPages: toolOutput({
+    count: z.number().int().describe("Rows returned on this page — page with offset when it equals the limit"),
+    landingPages: z.array(lpListItemSchema).describe("Landing pages, newest first"),
+  }),
+  getLandingPageDetails: toolOutput({
+    landingPage: lpDetailSchema.describe("Settings, the ordered image stack and the linked product"),
+  }),
+  createLandingPage: toolOutput({
+    landingPage: lpDetailSchema.describe("The created draft — its image stack is EMPTY until images are added"),
+    publicPath: z.string(),
+    publicUrl: z.string(),
+    note: z.string().describe("Next steps: add images, then publish"),
+  }),
+  updateLandingPage: toolOutput({
+    landingPage: lpDetailSchema,
+  }),
+  publishLandingPage: toolOutput({
+    landingPage: lpDetailSchema.describe("The published page"),
+    publicPath: z.string(),
+    publicUrl: z.string().describe("The live link the merchant pastes into ad sets"),
+    warning: z.string().optional().describe("Present when published with an EMPTY image stack — add images before running ads"),
+  }),
+  deleteLandingPage: toolOutput({
+    message: z.string(),
+  }),
+  uploadLandingPageImage: toolOutput({
+    image: z
+      .looseObject({
+        imageId: z.string().describe("The inserted image row's ID — used by removeLandingPageImage and reorderLandingPageImages"),
+        key: z.string().describe("The image's Media Key"),
+        url: z.string().describe("Where browsers fetch the image"),
+        position: z.number().int().nullable().describe("Stack position — 1 is the top of the page"),
+        width: z.number().int().nullable(),
+        height: z.number().int().nullable(),
+        altText: z.string().nullable(),
+        converted: z.boolean().optional().describe("True when the stored file is WebP (re-encoded, or the source already was)"),
+        storedContentType: z.string().optional().describe("The stored file's type — image/webp, or the source type when it could not be re-encoded"),
+      })
+      .describe("The inserted image (imageId, key, url, position)"),
+    advice: z.string().describe("Next-step guidance"),
+  }),
+  removeLandingPageImage: toolOutput({
+    images: z.array(lpImageRowSchema).describe("The stack after removal"),
+    count: z.number().int(),
+  }),
+  reorderLandingPageImages: toolOutput({
+    images: z.array(lpImageRowSchema).describe("The stack in its new order — index 0 is the top of the page"),
+    count: z.number().int(),
+  }),
+  duplicateLandingPage: toolOutput({
+    landingPage: lpDetailSchema.describe("The fresh draft copy"),
+    publicPath: z.string(),
+    publicUrl: z.string(),
+    note: z.string(),
+  }),
+  unpublishLandingPage: toolOutput({
+    landingPage: lpDetailSchema.describe("The page, now back in draft — its link 404s but history stays"),
+    publicPath: z.string(),
+    publicUrl: z.string(),
+  }),
+  archiveLandingPage: toolOutput({
+    landingPage: lpDetailSchema.describe("The archived page — history preserved, link retired"),
+    message: z.string(),
+  }),
+};
+
+export const removeLandingPageImageSchema = z.strictObject({
+  landingPageId: toolId()
+    .describe("The ID of the landing page that owns the image"),
+  imageId: toolId()
+    .describe(
+      "The ID of the image row to remove — get the current stack and its IDs from getLandingPageDetails",
+    ),
+});
+
+export const reorderLandingPageImagesSchema = z.strictObject({
+  landingPageId: toolId().describe("The ID of the landing page"),
+  imageIds: z
+    .array(toolId())
+    .min(1)
+    .describe(
+      "The COMPLETE ordered list of ALL image IDs for this landing page — index 0 becomes position 1 (top of the page). " +
+        "No duplicates, no omissions: the set must exactly match the current stack from getLandingPageDetails.",
+    ),
+});
+
+export const duplicateLandingPageSchema = z.strictObject({
+  landingPageId: toolId().describe("The ID of the landing page to duplicate"),
+});
+
+export const unpublishLandingPageSchema = z.strictObject({
+  landingPageId: toolId().describe("The ID of the landing page to unpublish"),
+});
+
+export const archiveLandingPageSchema = z.strictObject({
+  landingPageId: toolId().describe("The ID of the landing page to archive"),
+});
+
+export const LANDING_PAGE_TOOL_SCHEMAS: Record<string, z.ZodRawShape> = {
+  listLandingPages: listLandingPagesSchema.shape,
+  getLandingPageDetails: getLandingPageDetailsSchema.shape,
+  createLandingPage: createLandingPageToolSchema.shape,
+  updateLandingPage: updateLandingPageToolSchema.shape,
+  publishLandingPage: publishLandingPageSchema.shape,
+  deleteLandingPage: deleteLandingPageSchema.shape,
+  uploadLandingPageImage: uploadLandingPageImageSchema.shape,
+  removeLandingPageImage: removeLandingPageImageSchema.shape,
+  reorderLandingPageImages: reorderLandingPageImagesSchema.shape,
+  duplicateLandingPage: duplicateLandingPageSchema.shape,
+  unpublishLandingPage: unpublishLandingPageSchema.shape,
+  archiveLandingPage: archiveLandingPageSchema.shape,
+};
+
+/** The landing-page tools read the store's Worker env: media, the storefront URL, the upload workflow. */
+export type LandingPageToolEnv = Env;
+
+/** Verified session identity — structurally satisfied by McpProps. Only the
+ *  upload tool needs it (the background workflow audits through this actor). */
+export interface LandingPageToolSession {
+  userId: string;
+  role: "admin" | "staff";
+  name?: string;
+  email?: string;
+}
+
+/** Zod issues → one readable line. Empty paths (e.g. unrecognized keys) do not
+ *  get a dangling "path: " prefix. */
+function formatIssues(error: z.ZodError): string {
+  return error.issues
+    .map((issue) =>
+      issue.path.length > 0 ? `${issue.path.join(".")}: ${issue.message}` : issue.message,
+    )
+    .join("; ");
+}
+
+/**
+ * AI Tools for Landing Pages
+ *
+ * Landing pages are one-product marketing pages: an ordered image stack with
+ * the COD order form at the bottom. Merchants create several per product, run
+ * ads to each, and compare which converts. The charged price is always the
+ * product's catalog price — the price story lives in the images.
+ *
+ * Two-Layer Validation Pattern:
+ * - Layer 1 (LLM-level): Permissive input schema accepts any object to prevent SDK crashes
+ * - Layer 2 (App-level): STRICT validation inside execute() with graceful error handling —
+ *   unknown fields are rejected with an actionable message so the model can retry
+ */
+export const getLandingPageTools = (
+  db: ReturnType<typeof getDb>,
+  env: LandingPageToolEnv,
+  session?: LandingPageToolSession,
+) => ({
+
+  listLandingPages: tool({
+    description:
+      "List landing pages (newest first). " +
+      "Optionally filter by product or lifecycle status (draft | published | archived). " +
+      "Returns up to `limit` rows (default 50) — page with offset when the result fills the page. " +
+      "Each row includes the public slug — the link the merchant pastes into ad sets is /lp/<slug>.",
+    inputSchema: z.object({}).passthrough(), // Layer 1: Permissive input
+    execute: async (args) => {
+      try {
+        const validationSchema = listLandingPagesSchema;
+        const parsed = validationSchema.safeParse(args ?? {});
+        if (!parsed.success) {
+          return {
+            success: false,
+            error:
+              `Invalid filter arguments: ${formatIssues(parsed.error)}. ` +
+              "Expected: productId (ID, optional), status (draft|published|archived, optional), limit (1-200, default 50), offset (≥ 0). Unknown fields are rejected.",
+          };
+        }
+
+        const pages = await queries.listLandingPages(
+          db,
+          {
+            ...(parsed.data.productId ? { productId: parsed.data.productId } : {}),
+            ...(parsed.data.status ? { status: parsed.data.status } : {}),
+          },
+          { limit: parsed.data.limit, offset: parsed.data.offset },
+        );
+        const baseUrl = await resolveStorefrontBaseUrl(db, env.STOREFRONT_URL);
+        return {
+          success: true,
+          count: pages.length,
+          landingPages: pages.map((p) => ({
+            id: p.id,
+            slug: p.slug,
+            name: p.name,
+            status: p.status,
+            productId: p.productId,
+            productName: p.productName,
+            imageCount: p.imageCount,
+            publicPath: storefrontPath("landing", { slug: p.slug }),
+            publicUrl: buildLandingPagePublicUrl(baseUrl, p.slug),
+          })),
+        };
+      } catch (error) {
+        return { success: false, error: `Failed to list landing pages: ${(error as Error).message}` };
+      }
+    },
+  }),
+
+  getLandingPageDetails: tool({
+    description:
+      "Get full landing page details by ID: settings, the ordered image stack and the linked product. " +
+      "Use this to inspect a page's creatives and spacing before editing.",
+    inputSchema: z.object({}).passthrough(), // Layer 1: Permissive input
+    execute: async (args) => {
+      try {
+        const parsed = getLandingPageDetailsSchema.safeParse(args ?? {});
+        if (!parsed.success) {
+          return {
+            success: false,
+            error: `Invalid arguments: ${formatIssues(parsed.error)}. Expected: landingPageId (ID). Unknown fields are rejected.`,
+          };
+        }
+
+        const lp = await queries.getLandingPageById(db, parsed.data.landingPageId, mediaDeliveryOf(env));
+        if (!lp) {
+          return { success: false, error: `Landing page ${parsed.data.landingPageId} not found` };
+        }
+        return { success: true, landingPage: lp };
+      } catch (error) {
+        return { success: false, error: `Failed to get landing page: ${(error as Error).message}` };
+      }
+    },
+  }),
+
+  createLandingPage: tool({
+    description:
+      "Create a draft landing page for a product. The slug defaults to lp-<8 chars> and is editable later via updateLandingPage. " +
+      "A new page starts with an EMPTY image stack — add images with uploadLandingPageImage before publishing. " +
+      "The page charges the product's catalog price — there is no price override; the price story lives in the images.",
+    inputSchema: z.object({}).passthrough(), // Layer 1: Permissive input
+    execute: async (args) => {
+      try {
+        const parsed = createLandingPageToolSchema.safeParse(args ?? {});
+        if (!parsed.success) {
+          return {
+            success: false,
+            error:
+              `Invalid arguments: ${formatIssues(parsed.error)}. ` +
+              "Expected: name (2-200 chars), productId (ID), optional slug ([a-z0-9-]{3,60}), optional imageGap (0-200 px). Unknown fields are rejected — images cannot be set at creation.",
+          };
+        }
+
+        const { id, slug } = await queries.createLandingPage(db, parsed.data);
+        const lp = await queries.getLandingPageById(db, id, mediaDeliveryOf(env));
+        const baseUrl = await resolveStorefrontBaseUrl(db, env.STOREFRONT_URL);
+        return {
+          success: true,
+          landingPage: lp,
+          publicPath: storefrontPath("landing", { slug }),
+          publicUrl: buildLandingPagePublicUrl(baseUrl, slug),
+          note: "Draft created with an empty image stack. Add images via uploadLandingPageImage, then publishLandingPage to make the link live.",
+        };
+      } catch (error) {
+        return { success: false, error: `Failed to create landing page: ${(error as Error).message}` };
+      }
+    },
+  }),
+
+  updateLandingPage: tool({
+    description:
+      "Partially update a landing page's settings: name, slug, image gap (imageGap, pixels 0-200), or SEO meta (metaTitle, metaDescription). " +
+      "A taken slug is rejected. The image stack is NOT managed by this tool — use uploadLandingPageImage, removeLandingPageImage, and reorderLandingPageImages instead.",
+    inputSchema: z.object({}).passthrough(), // Layer 1: Permissive input
+    execute: async (args) => {
+      try {
+        const parsed = updateLandingPageToolSchema.safeParse(args ?? {});
+        if (!parsed.success) {
+          return {
+            success: false,
+            error:
+              `Invalid arguments: ${formatIssues(parsed.error)}. ` +
+              "Expected: landingPageId (ID) and updates { name?, slug?, imageGap?, metaTitle?, metaDescription? }. Unknown fields are rejected — the image stack is not updatable here.",
+          };
+        }
+
+        await queries.updateLandingPage(db, parsed.data.landingPageId, parsed.data.updates);
+        const lp = await queries.getLandingPageById(db, parsed.data.landingPageId, mediaDeliveryOf(env));
+        return { success: true, landingPage: lp };
+      } catch (error) {
+        return { success: false, error: `Failed to update landing page: ${(error as Error).message}` };
+      }
+    },
+  }),
+
+  publishLandingPage: tool({
+    description:
+      "Publish a landing page — its link /lp/<slug> goes live. " +
+      "The result carries a warning when the page's image stack is empty (the public page would render only the order form). " +
+      "unpublishLandingPage returns it to draft later (the link stops resolving but history stays).",
+    inputSchema: z.object({}).passthrough(), // Layer 1: Permissive input
+    execute: async (args) => {
+      try {
+        const parsed = publishLandingPageSchema.safeParse(args ?? {});
+        if (!parsed.success) {
+          return {
+            success: false,
+            error: `Invalid arguments: ${formatIssues(parsed.error)}. Expected: landingPageId (ID). Unknown fields are rejected.`,
+          };
+        }
+
+        const existing = await queries.getLandingPageRow(db, parsed.data.landingPageId);
+        if (!existing) {
+          return { success: false, error: `Landing page ${parsed.data.landingPageId} not found` };
+        }
+
+        await queries.publishLandingPage(db, parsed.data.landingPageId);
+        const lp = await queries.getLandingPageById(db, parsed.data.landingPageId, mediaDeliveryOf(env));
+        const slug = lp?.slug ?? existing.slug;
+        const imageCount = lp?.images.length ?? 0;
+        const baseUrl = await resolveStorefrontBaseUrl(db, env.STOREFRONT_URL);
+        return {
+          success: true,
+          landingPage: lp,
+          publicPath: storefrontPath("landing", { slug }),
+          publicUrl: buildLandingPagePublicUrl(baseUrl, slug),
+          ...(imageCount === 0
+            ? {
+                warning:
+                  "Published with an EMPTY image stack — the public page will render only the order form with no images. " +
+                  "Add images via uploadLandingPageImage before pointing ads at this link.",
+              }
+            : {}),
+        };
+      } catch (error) {
+        return { success: false, error: `Failed to publish: ${(error as Error).message}` };
+      }
+    },
+  }),
+
+  deleteLandingPage: tool({
+    description:
+      "Permanently delete a landing page with NO attributed orders. " +
+      "Refused (LANDING_PAGE_HAS_ORDERS) when any order references the page — archive it instead via archiveLandingPage so attribution history stays intact. " +
+      "This action is immediate and irreversible.",
+    inputSchema: z.object({}).passthrough(), // Layer 1: Permissive input
+    execute: async (args) => {
+      try {
+        const parsed = deleteLandingPageSchema.safeParse(args ?? {});
+        if (!parsed.success) {
+          return {
+            success: false,
+            error: `Invalid arguments: ${formatIssues(parsed.error)}. Expected: landingPageId (ID). Unknown fields are rejected.`,
+          };
+        }
+
+        await queries.deleteLandingPageWithGuard(db, parsed.data.landingPageId);
+        return { success: true, message: "Landing page deleted" };
+      } catch (error) {
+        return { success: false, error: `Failed to delete landing page: ${(error as Error).message}` };
+      }
+    },
+  }),
+
+  uploadLandingPageImage: tool({
+    description:
+      "Upload an image into a landing page's image stack (the marketing story — price framing, urgency, benefits — lives in the images). " +
+      "The image is fetched, stored and added during this call; the answer is the inserted image.\n" +
+      "Pass the image in EXACTLY ONE of three ways:\n" +
+      "• image (file object) — the way ChatGPT and chat clients pass a conversation image: the client fills download_url itself. " +
+      "Generate the image first, then pass it here.\n" +
+      "• imageUrl — any directly-fetchable public http(s) URL (e.g. a re-hosted image). Login-protected or expired links fail with 'not publicly fetchable' — re-host and retry.\n" +
+      "• imageBase64 — programmatic clients only. NEVER from a chat client: inline image data is blocked by client safety checks before the call is sent.\n" +
+      "contentType must match the actual bytes (ChatGPT image generation outputs image/png) — verified server-side by magic-byte sniffing. " +
+      "Images are STORED as WebP (server-side conversion for fast page loads; if conversion is unavailable the original format is kept). " +
+      "New images append to the end of the stack; set position to place one (1 = top of the page), or reorder the whole stack later with reorderLandingPageImages. " +
+      "A failed upload adds nothing and is safe to retry.",
+    inputSchema: z.object({}).passthrough(), // Layer 1: Permissive input
+    execute: async (args) => {
+      try {
+        const parsed = uploadLandingPageImageSchema.safeParse(args ?? {});
+        if (!parsed.success) {
+          return {
+            success: false,
+            error:
+              `Invalid arguments: ${formatIssues(parsed.error)}. ` +
+              "Expected: landingPageId (ID), contentType (image/png|jpeg|webp|gif), and exactly one of image (chat clients — file object), imageUrl (http(s) URL), or imageBase64 (programmatic clients only); " +
+              "optional: altText, position. Unknown fields are rejected.",
+          };
+        }
+        const data = parsed.data;
+        if (!session) {
+          return {
+            success: false,
+            error: "Upload requires a verified session identity — none is attached to this connection.",
+          };
+        }
+
+        let source: LandingImageSource;
+        if (data.image !== undefined) {
+          if (!/^https?:\/\//.test(data.image.download_url)) {
+            return { success: false, error: "The image file's download_url must be an http(s) URL — cannot fetch it server-side." };
+          }
+          source = { kind: "url", url: data.image.download_url };
+        } else if (data.imageUrl !== undefined) {
+          source = { kind: "url", url: data.imageUrl };
+        } else if (data.imageBase64 !== undefined) {
+          try {
+            source = { kind: "bytes", bytes: decodeBase64Image(data.imageBase64) };
+          } catch {
+            return { success: false, error: "imageBase64 is not valid base64." };
+          }
+        } else {
+          return {
+            success: false,
+            error: "Provide exactly one of image (chat clients — file object), imageUrl (http(s) URL), or imageBase64 (programmatic clients only).",
+          };
+        }
+
+        const image = await addAgentLandingImage(env, {
+          landingPageId: data.landingPageId,
+          source,
+          contentType: data.contentType,
+          altText: data.altText ?? null,
+          ...(data.position !== undefined ? { position: data.position } : {}),
+          actor: { id: session.userId, name: session.name || session.email || session.userId, role: session.role },
+        });
+        return {
+          success: true,
+          image,
+          advice:
+            "The image is in the landing page stack. Review it with getLandingPageDetails, arrange the stack with reorderLandingPageImages if needed, " +
+            "then publishLandingPage to make the link live.",
+        };
+      } catch (error) {
+        if (error instanceof LandingImageError) return { success: false, error: error.message };
+        return { success: false, error: `Failed to upload image: ${(error as Error).message}` };
+      }
+    },
+  }),
+
+  removeLandingPageImage: tool({
+    description:
+      "Remove an image from a landing page's stack — get the current image IDs from getLandingPageDetails. " +
+      "Storage note: duplicated pages share their images; an image's file is deleted only once nothing else shows it. " +
+      "Returns the updated stack. Removing is final for this page — restoring means re-uploading via uploadLandingPageImage.",
+    inputSchema: z.object({}).passthrough(), // Layer 1: Permissive input
+    execute: async (args) => {
+      try {
+        const parsed = removeLandingPageImageSchema.safeParse(args ?? {});
+        if (!parsed.success) {
+          return {
+            success: false,
+            error: `Invalid arguments: ${formatIssues(parsed.error)}. Expected: landingPageId (ID) and imageId (ID). Unknown fields are rejected.`,
+          };
+        }
+        const { landingPageId, imageId } = parsed.data;
+
+        const image = await queries.getLandingPageImage(db, landingPageId, imageId);
+        if (!image) {
+          return {
+            success: false,
+            error: `Image ${imageId} not found on landing page ${landingPageId}`,
+          };
+        }
+
+        await queries.deleteLandingPageImage(db, landingPageId, imageId);
+        await releaseShown(env, [image.mediaKey], `image ${imageId} of landing page ${landingPageId}`);
+        const images = await queries.getLandingPageImages(db, landingPageId, mediaDeliveryOf(env));
+        return { success: true, images, count: images.length };
+      } catch (error) {
+        return { success: false, error: `Failed to remove image: ${(error as Error).message}` };
+      }
+    },
+  }),
+
+  reorderLandingPageImages: tool({
+    description:
+      "Set the order of a landing page's image stack. Index 1 is the TOP of the page — the first thing shoppers see, so put the strongest creative there. " +
+      "Send the COMPLETE ordered array of ALL image IDs (from getLandingPageDetails): every current image exactly once — no duplicates, no omissions. " +
+      "Partial or mismatched lists are rejected. Returns the stack in its new order.",
+    inputSchema: z.object({}).passthrough(), // Layer 1: Permissive input
+    execute: async (args) => {
+      try {
+        const parsed = reorderLandingPageImagesSchema.safeParse(args ?? {});
+        if (!parsed.success) {
+          return {
+            success: false,
+            error: `Invalid arguments: ${formatIssues(parsed.error)}. Expected: landingPageId (ID) and imageIds (the complete ordered array of all image IDs, index 1 = top of the page). Unknown fields are rejected.`,
+          };
+        }
+
+        const images = await queries.reorderLandingPageImagesChecked(
+          db,
+          parsed.data.landingPageId,
+          parsed.data.imageIds,
+          mediaDeliveryOf(env),
+        );
+        return { success: true, images, count: images.length };
+      } catch (error) {
+        return { success: false, error: `Failed to reorder images: ${(error as Error).message}` };
+      }
+    },
+  }),
+
+  duplicateLandingPage: tool({
+    description:
+      "Duplicate a landing page: a fresh DRAFT with a new slug, the same product, spacing, SEO meta, and image stack (copies share the original storage objects). " +
+      "Attributed orders and published state are NEVER copied — a duplicate is a fresh creative test. " +
+      "Returns the new draft with its new slug and public link.",
+    inputSchema: z.object({}).passthrough(), // Layer 1: Permissive input
+    execute: async (args) => {
+      try {
+        const parsed = duplicateLandingPageSchema.safeParse(args ?? {});
+        if (!parsed.success) {
+          return {
+            success: false,
+            error: `Invalid arguments: ${formatIssues(parsed.error)}. Expected: landingPageId (ID). Unknown fields are rejected.`,
+          };
+        }
+
+        const newId = await queries.duplicateLandingPage(db, parsed.data.landingPageId);
+        if (!newId) {
+          return { success: false, error: `Landing page ${parsed.data.landingPageId} not found` };
+        }
+
+        const lp = await queries.getLandingPageById(db, newId, mediaDeliveryOf(env));
+        if (!lp) {
+          return { success: false, error: "Failed to load the duplicated landing page" };
+        }
+        const baseUrl = await resolveStorefrontBaseUrl(db, env.STOREFRONT_URL);
+        return {
+          success: true,
+          landingPage: lp,
+          publicPath: storefrontPath("landing", { slug: lp.slug }),
+          publicUrl: buildLandingPagePublicUrl(baseUrl, lp.slug),
+          note: "Fresh draft created. Edit it, then publishLandingPage when ready.",
+        };
+      } catch (error) {
+        return { success: false, error: `Failed to duplicate landing page: ${(error as Error).message}` };
+      }
+    },
+  }),
+
+  unpublishLandingPage: tool({
+    description:
+      "Return a published landing page to draft — its /lp/<slug> link stops resolving (404) but its order attribution stays intact. " +
+      "Publish again anytime with publishLandingPage.",
+    inputSchema: z.object({}).passthrough(), // Layer 1: Permissive input
+    execute: async (args) => {
+      try {
+        const parsed = unpublishLandingPageSchema.safeParse(args ?? {});
+        if (!parsed.success) {
+          return {
+            success: false,
+            error: `Invalid arguments: ${formatIssues(parsed.error)}. Expected: landingPageId (ID). Unknown fields are rejected.`,
+          };
+        }
+
+        const existing = await queries.getLandingPageRow(db, parsed.data.landingPageId);
+        if (!existing) {
+          return { success: false, error: `Landing page ${parsed.data.landingPageId} not found` };
+        }
+
+        await queries.unpublishLandingPage(db, parsed.data.landingPageId);
+        const lp = await queries.getLandingPageById(db, parsed.data.landingPageId, mediaDeliveryOf(env));
+        const baseUrl = await resolveStorefrontBaseUrl(db, env.STOREFRONT_URL);
+        return {
+          success: true,
+          landingPage: lp,
+          publicPath: storefrontPath("landing", { slug: lp?.slug ?? existing.slug }),
+          publicUrl: buildLandingPagePublicUrl(baseUrl, lp?.slug ?? existing.slug),
+        };
+      } catch (error) {
+        return { success: false, error: `Failed to unpublish: ${(error as Error).message}` };
+      }
+    },
+  }),
+
+  archiveLandingPage: tool({
+    description:
+      "Retire a landing page: the link stops resolving and the page leaves the active lists, but its order attribution history stays intact. " +
+      "This is the REQUIRED exit for a page with attributed orders — deleteLandingPage refuses those and tells you to archive instead. " +
+      "The page stays inspectable via getLandingPageDetails.",
+    inputSchema: z.object({}).passthrough(), // Layer 1: Permissive input
+    execute: async (args) => {
+      try {
+        const parsed = archiveLandingPageSchema.safeParse(args ?? {});
+        if (!parsed.success) {
+          return {
+            success: false,
+            error: `Invalid arguments: ${formatIssues(parsed.error)}. Expected: landingPageId (ID). Unknown fields are rejected.`,
+          };
+        }
+
+        const existing = await queries.getLandingPageRow(db, parsed.data.landingPageId);
+        if (!existing) {
+          return { success: false, error: `Landing page ${parsed.data.landingPageId} not found` };
+        }
+
+        await queries.archiveLandingPage(db, parsed.data.landingPageId);
+        const lp = await queries.getLandingPageById(db, parsed.data.landingPageId, mediaDeliveryOf(env));
+        return {
+          success: true,
+          landingPage: lp,
+          message: "Landing page archived — its order attribution history is preserved.",
+        };
+      } catch (error) {
+        return { success: false, error: `Failed to archive landing page: ${(error as Error).message}` };
+      }
+    },
+  }),
+});

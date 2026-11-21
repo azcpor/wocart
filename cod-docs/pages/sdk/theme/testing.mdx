@@ -1,0 +1,263 @@
+---
+description: The checks that prove a @wocart/theme theme honors its contract, with examples that run in Astro's container.
+---
+
+# Testing a theme
+
+An editable theme makes four promises: its definitions are valid, its manifest
+can be saved and read back, its default pages pass validation, and those pages
+render. These four checks prove those promises in your own test suite. Add
+checks for your own behavior after these pass.
+
+The [theme starter](/sdk/theme/starter) has all of them as runnable files in
+`tests/unit/`, with the Vitest configuration Astro components need
+(`vitest.config.ts`, `getViteConfig` from `astro/config`), so a theme made
+with it runs them with `npm test`.
+
+## 1. The theme definition is valid
+
+```ts
+import { validateThemeDefinition } from "@wocart/theme";
+import { theme } from "../theme/theme";
+
+expect(validateThemeDefinition(theme)).toEqual([]);
+```
+
+Once the catalog itself is sound, assembly also reads every default document
+and builds every preset through it, so a shipped document naming an unknown
+type or an invalid value fails here (`invalid-document`, `invalid-preset`).
+When the theme declares `content`, every `contentKey` is checked against every
+pack. An empty array is the only pass.
+
+## 2. The manifest reloads cleanly
+
+```ts
+import { themeManifest, validateThemeManifest } from "@wocart/theme";
+
+const manifest = themeManifest(theme);
+const checked = validateThemeManifest(JSON.parse(JSON.stringify(manifest)));
+
+expect(checked.manifest).not.toBeNull();
+expect(checked.issues).toEqual([]);
+```
+
+This catches a non-serializable value, a key/type mismatch, and any relational
+rule that assembly and validation disagree on. A non-semver theme version is
+the one advisory issue; fix it rather than allow it.
+
+## 3. Default pages validate
+
+```ts
+import { validatePageData } from "@wocart/theme";
+
+const documents = [
+  ...(theme.surfaces ?? []).map((surface) => surface.document),
+  ...(theme.areas ?? []).map((area) => area.document),
+];
+for (const locale of theme.locales ?? []) {
+  const scope = { content: theme.content?.[locale], locales: [locale] };
+  for (const document of documents) {
+    if (document === undefined) continue;
+    expect(validatePageData(theme, document, scope).issues).toEqual([]);
+  }
+}
+```
+
+`validatePageData` returns `{ page, issues }`; assert on `issues`. Run it for
+every declared language, not only the primary: a required text field filled
+only through one language's pack shows up as `missing-required-prop` in the
+others.
+
+## 4. Default pages render
+
+Render each section through `InstanceView` with Astro's container, one read
+cache per page, and a stand-in `StoreClient`:
+
+```ts
+import { experimental_AstroContainer as AstroContainer } from "astro/container";
+import { createReadCache, type RendererIssue } from "@wocart/theme/astro";
+import InstanceView from "@wocart/theme/astro/InstanceView.astro";
+import type { ThemeRenderContext } from "@wocart/theme";
+import type { StoreClient } from "@wocart/storefront/server";
+import type { StoreConfig } from "@wocart/storefront";
+
+const container = await AstroContainer.create();
+const issues: RendererIssue[] = [];
+const page = theme.surfaces?.find((surface) => surface.key === "home")?.document;
+if (page === undefined) throw new Error("the home surface ships no document");
+
+const products: unknown[] = [];
+const storefront = {
+  products: { list: async () => products },
+} as unknown as StoreClient;
+
+const context = {
+  store: {} as StoreConfig,
+  content: {},
+  locale: "en",
+  isRTL: false,
+  url: "/",
+} satisfies ThemeRenderContext;
+
+const reads = createReadCache();
+
+for (const section of page.sections) {
+  await container.renderToString(InstanceView, {
+    props: {
+      instance: section,
+      theme,
+      context,
+      storefront,
+      reads,
+      onIssue: (issue) => issues.push(issue),
+    },
+  });
+}
+
+expect(issues).toEqual([]);
+```
+
+One cache per page render is the point: siblings share a resource, and separate
+pages do not. Assert on `issues` rather than on the absence of an exception —
+the renderer degrades, it does not throw.
+
+A `load` is only called when its section renders. Give the stand-in client the
+methods the load uses, and make it fail on purpose in a separate test:
+
+```ts
+const failingIssues: RendererIssue[] = [];
+const failing = {
+  products: { list: async () => { throw new Error("offline"); } },
+} as unknown as StoreClient;
+
+await container.renderToString(InstanceView, {
+  props: {
+    instance: page.sections.find((section) => section.type === "best-sellers")!,
+    theme,
+    context,
+    storefront: failing,
+    reads,
+    onIssue: (issue) => failingIssues.push(issue),
+  },
+});
+
+expect(failingIssues).toContainEqual(
+  expect.objectContaining({ code: "load-failed" }),
+);
+```
+
+The section's base props still render; only the loaded part is missing.
+
+## Saved-document tests
+
+The four checks cover the theme's own documents. Add tests for documents that
+arrive from a store:
+
+```ts
+import { resolveSurfaceDocument } from "@wocart/theme";
+
+const saved = {
+  version: 1,
+  surface: "home",
+  sections: [
+    { id: "gone-1", type: "removed-layout" },
+    { id: "hero-1", type: "hero", props: { title: "Bonjour" } },
+  ],
+};
+
+const result = resolveSurfaceDocument(theme, "home", saved, { locales: ["fr"] });
+
+expect(result.source).toBe("saved");
+// The unknown section stays in the document, reported; the renderer draws nothing for it.
+expect(result.page.sections.map((section) => section.type)).toEqual(["removed-layout", "hero"]);
+expect(result.issues).toContainEqual(
+  expect.objectContaining({ code: "unknown-type", path: "sections[0].type" }),
+);
+```
+
+| Case to cover | Expected |
+| --- | --- |
+| No saved document | The shipped default |
+| Invalid envelope | The shipped default, with `page: null` from `parsePageData` |
+| Document for another theme | The shipped default, `reason: "other-theme"`, a `theme-mismatch` issue |
+| Unknown section type | Kept in the document with an `unknown-type` issue; it renders nothing, the rest renders |
+| Empty `sections` | Empty page — the merchant emptied it |
+| Hidden required section or block | Shown again (`hidden` dropped), with a `missing-required-block` issue |
+| List over its `max` | Rendered up to `max`, `limit-exceeded` |
+
+## Release checks
+
+Before a release, compare the manifests:
+
+```ts
+import { diffThemeManifests } from "@wocart/theme";
+
+const { breaking, additive } = diffThemeManifests(previous, next);
+expect(breaking).toEqual([]);
+```
+
+If a breaking change is intentional, bump the theme's major version and say
+what will degrade; Wocart Cloud refuses a breaking release under the same
+major. Also run `pluralFormIssues(pack, locale)` over every pack:
+it reports a plural form the language needs but the pack lacks, or a form the
+language never uses.
+
+## What to test in the browser
+
+The four checks do not execute browser scripts. Test separately:
+
+- a section whose behaviour is bound with `bindEach` mounts again after a
+  patch or a swap (no script listens for the swap events itself),
+- a full-page preview replacement dispatches `astro:page-load`,
+- the basket and checkout scripts keep working after a preview update,
+- a shopper's page contains no `wocart:start` / `wocart:end` comments.
+
+## Keep the renderer out of browser tests
+
+`@wocart/theme`'s root entry and Zod are server and build dependencies. A
+`<script>` may import only the browser entries — `@wocart/storefront` (its
+root), `@wocart/storefront/review-media`, `@wocart/theme/lifecycle`,
+`@wocart/theme/messages` and, on the preview route, `@wocart/theme/preview` —
+never `@wocart/storefront/server`, `@wocart/storefront/astro`, the renderer or
+the validators. Both packages test their own browser entries for this; the
+starter adds a guard that follows every browser script's imports
+(`tests/unit/guards.test.ts`, "the theme's browser code").
+
+## Guard tests: the rules as failing tests
+
+The SDK checks the contract; it cannot see a theme's source. The starter
+turns its rules into tests that read the theme's own files and fail on a break
+(`tests/unit/guards.test.ts` and `tests/unit/copy.test.ts`, which read the
+source through `tests/unit/source.ts`). A theme built from scratch copies them
+and adapts the paths:
+
+| Rule | What the guard asserts |
+| --- | --- |
+| One client | Only the theme's one SDK module calls `createStoreClient` |
+| Published entry points | No import of `@wocart/*/dist/…` or `src/…`, no import of platform internals |
+| WhatsApp | Only the theme's binding module calls `whatsAppContact`; no file contains `wa.me` or reads `config.whatsapp` |
+| Platform links | No hand-written platform path (`"/products/"`, `"/track-order"`, …) outside `storefrontPath` |
+| Browser bundle | No browser script imports Zod, a schema, `@wocart/storefront/server` or the root of `@wocart/theme` |
+| Copy | No literal text in markup; every pack key exists in every language and is used; plural messages carry each language's forms |
+| Colours | Tokens are derived on `.wc-scheme`, and no element carries a scheme marker of its own |
+| Page types | The manifest carries a surface for every platform page type |
+| Not found | Every resource route answers a missing resource with `notFound` |
+| Store facts | No word, default, preset or document states a delivery reach, a period, a percentage, opening hours or a phone call |
+| Right to left | A physical `left`/`right` appears only in a rule for one direction |
+| Both hosts | The build scripts and `astro.config.mjs` keep the Cloudflare and Vercel adapters |
+
+[The starter, file by file](/sdk/theme/project#the-rules-and-the-tests-that-keep-them)
+lists each test with the command that runs it. Prove each guard once by
+breaking the code and watching it fail: a guard that never fails checks
+nothing.
+
+## Definition of done
+
+- [ ] `validateThemeDefinition(theme)` is empty.
+- [ ] The manifest round trip validates.
+- [ ] Every default document validates in every declared language.
+- [ ] Every default document renders with no unexpected `onIssue`.
+- [ ] Each saved-document fallback has a test.
+- [ ] `diffThemeManifests` has no unintended breaking change.
+- [ ] Every pack passes `pluralFormIssues`.
+- [ ] Browser behavior has its own test or a manual check.

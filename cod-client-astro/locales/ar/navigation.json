@@ -1,0 +1,65 @@
+{
+  "sidebar": {
+    "dashboard": "الرئيسية",
+    "orders": "الطلبات",
+    "orders_abandoned": "الطلبات المتروكة",
+    "customers": "العملاء",
+    "products": "المنتجات",
+    "collections": "المجموعات",
+    "categories": "التصنيفات",
+    "customer_groups": "المجموعات",
+    "customer_tags": "الوسوم",
+    "delivery": "التوصيل",
+    "delivery_drivers": "السائقون",
+    "delivery_companies": "شركات التوصيل",
+    "delivery_shipping": "أسعار التوصيل",
+    "team": "الفريق",
+    "settings": "الإعدادات",
+    "general": "القائمة الرئيسية",
+    "reviews": "التقييمات",
+    "offers": "العروض",
+    "coupons": "الكوبونات",
+    "landing_pages": "صفحات البيع",
+    "stock_management": "المخزون",
+    "mcp": "وكلاء الذكاء الاصطناعي",
+    "store_pages": "الصفحات",
+    "navigation_menus": "التنقل",
+    "checkout_form": "نموذج الطلب",
+    "online_store": "المتجر الإلكتروني",
+    "delivery_labels": "الملصقات",
+    "integrations": "التكاملات",
+    "apps": "التطبيقات",
+    "orders_spam": "السبام",
+    "orders_team": "فريق التأكيد",
+    "costs": "المصاريف"
+  },
+  "navbar": {
+    "search_placeholder": "ابحث عن طلب، عميل أو رقم تتبع…"
+  },
+  "theme": {
+    "label": "المظهر",
+    "light": "فاتح",
+    "dark": "داكن"
+  },
+  "menu": {
+    "open": "فتح القائمة",
+    "close": "إغلاق القائمة",
+    "collapse_group": "إخفاء",
+    "expand_group": "إظهار"
+  },
+  "account": {
+    "label": "حسابك",
+    "profile": "ملفك الشخصي",
+    "sign_out": "تسجيل الخروج"
+  },
+  "skip_to_content": "الانتقال إلى المحتوى",
+  "language": {
+    "label": "اللغة",
+    "arabic": "العربية",
+    "english": "English",
+    "french": "Français"
+  },
+  "badge": {
+    "new": "جديد"
+  }
+}

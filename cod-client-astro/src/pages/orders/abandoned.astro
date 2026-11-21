@@ -1,0 +1,13 @@
+---
+import DashboardLayout from "@/layouts/DashboardLayout.astro";
+import { PageSkeleton } from "@/components/layout/PageSkeleton";
+import AbandonedOrdersPageApp from "@/features/orders/components/AbandonedOrdersPageApp";
+---
+
+<DashboardLayout>
+  <PageSkeleton gate="required" />
+
+  <div data-auth-gate="required" hidden>
+    <AbandonedOrdersPageApp client:only="react" />
+  </div>
+</DashboardLayout>

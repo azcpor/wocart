@@ -1,0 +1,224 @@
+/**
+ * Cart lines — the order engine's single internal representation.
+ *
+ * Three request shapes reach the storefront order endpoint, and all three
+ * collapse to one list here so the engine below has exactly one thing to
+ * understand:
+ *
+ *   items[]             — a cart: several products, each with its own quantity
+ *   variantSelections[] — one product, a variant chosen per unit
+ *   flat productId      — the legacy single-product request
+ *
+ * Keeping the legacy shapes as adapters at this seam (rather than as branches
+ * inside the engine) is what lets existing storefronts, landing pages and
+ * partner integrations keep working byte-for-byte while the engine only ever
+ * sees a list.
+ *
+ * Pure: no database, no clock, no randomness. Everything here is decided from
+ * the request alone, which is why it can be property-tested exhaustively.
+ */
+
+/** One resolved line: a product, optionally a variant, and how many. */
+export interface CartLine {
+  productId: string;
+  variantId: string | null;
+  variantLabel: string | null;
+  quantity: number;
+  /**
+   * Name as the storefront displayed it. Denormalised onto the order line so
+   * the merchant sees what the customer saw, even if the product is renamed
+   * later. Never used for pricing.
+   */
+  productName: string;
+  /**
+   * Offer explicitly chosen for this product, if the shopper picked a tier.
+   * The server still validates it; an offer that does not apply is ignored.
+   */
+  offerId?: string;
+}
+
+/**
+ * The subset of the request shape this module reads.
+ *
+ * `productId` and `productName` are optional because a basket request has no
+ * single representative product. The request schema requires them for every
+ * shape that actually needs them — anything without `items[]` — so by the time
+ * a request reaches here, either the basket is present or these are.
+ */
+export interface OrderLineInput {
+  productId?: string;
+  productName?: string;
+  variantId?: string | null;
+  variantLabel?: string | null;
+  quantity?: number;
+  offerId?: string;
+  variantSelections?: Array<{ variantId: string; variantLabel?: string | null }>;
+  items?: Array<{
+    productId: string;
+    productName: string;
+    variantId?: string | null;
+    variantLabel?: string | null;
+    quantity: number;
+    offerId?: string;
+  }>;
+}
+
+/**
+ * Upper bounds. The cart is attacker-controlled input that drives database
+ * writes and a carrier call, so it is bounded before it reaches either.
+ *
+ * MAX_CART_LINES keeps the commit batch around 70 statements — comfortably
+ * inside D1's limits — and covers every genuine COD basket.
+ */
+export const MAX_CART_LINES = 20;
+export const MAX_LINE_QUANTITY = 100;
+
+/** Identity of a line: same product AND same variant is the same line. */
+export function lineKey(productId: string, variantId: string | null): string {
+  return `${productId}\u0000${variantId ?? ""}`;
+}
+
+export class CartValidationError extends Error {
+  constructor(
+    message: string,
+    readonly code: "TOO_MANY_LINES" | "LINE_QUANTITY_EXCEEDED" | "EMPTY_CART",
+    readonly detail?: Record<string, unknown>,
+  ) {
+    super(message);
+    this.name = "CartValidationError";
+  }
+}
+
+/**
+ * Collapse any accepted request shape into a deduplicated list of cart lines.
+ *
+ * Duplicate lines are merged rather than rejected: a browser can legitimately
+ * send the same product twice (added from two places), and merging is both the
+ * forgiving answer and the safe one — two lines for the same variant would
+ * double-count against stock and could be used to inflate an offer trigger.
+ *
+ * Order is preserved by first appearance, so the merchant sees the basket in
+ * the order the shopper built it, and so the result is deterministic.
+ *
+ * Throws CartValidationError when the request exceeds its bounds. Quantity
+ * bounds are also enforced by the request schema; they are re-checked here
+ * because this function is the engine's only entry point and must hold on its
+ * own, whatever calls it.
+ */
+export function normalizeOrderLines(input: OrderLineInput): CartLine[] {
+  const raw: CartLine[] = [];
+
+  if (input.items && input.items.length > 0) {
+    for (const item of input.items) {
+      raw.push({
+        productId: item.productId,
+        productName: item.productName,
+        variantId: item.variantId ?? null,
+        variantLabel: item.variantLabel ?? null,
+        quantity: item.quantity,
+        offerId: item.offerId,
+      });
+    }
+  } else if (!input.productId || !input.productName) {
+    // Neither a basket nor a product. The request schema refuses this shape, so
+    // reaching it means a caller bypassed the seam — fail as an empty cart
+    // rather than pushing an undefined product id at the catalog.
+    throw new CartValidationError("Cart is empty", "EMPTY_CART");
+  } else if (input.variantSelections && input.variantSelections.length > 0) {
+    // One entry per ordered unit — the grouping below turns them into lines.
+    for (const selection of input.variantSelections) {
+      raw.push({
+        productId: input.productId,
+        productName: input.productName,
+        variantId: selection.variantId,
+        variantLabel: selection.variantLabel ?? null,
+        quantity: 1,
+        offerId: input.offerId,
+      });
+    }
+  } else {
+    raw.push({
+      productId: input.productId,
+      productName: input.productName,
+      variantId: input.variantId ?? null,
+      variantLabel: input.variantLabel ?? null,
+      quantity: input.quantity ?? 1,
+      offerId: input.offerId,
+    });
+  }
+
+  const merged = new Map<string, CartLine>();
+  for (const line of raw) {
+    const key = lineKey(line.productId, line.variantId);
+    const existing = merged.get(key);
+    if (existing) {
+      existing.quantity += line.quantity;
+      // First non-empty label and offer win: the shopper saw those first, and
+      // a later duplicate carrying nothing must not erase them.
+      existing.variantLabel ??= line.variantLabel;
+      existing.offerId ??= line.offerId;
+    } else {
+      merged.set(key, { ...line });
+    }
+  }
+
+  const lines = [...merged.values()];
+
+  if (lines.length === 0) {
+    throw new CartValidationError("Cart is empty", "EMPTY_CART");
+  }
+  if (lines.length > MAX_CART_LINES) {
+    throw new CartValidationError(
+      `A cart cannot hold more than ${MAX_CART_LINES} different items`,
+      "TOO_MANY_LINES",
+      { lines: lines.length, max: MAX_CART_LINES },
+    );
+  }
+  for (const line of lines) {
+    // Checked AFTER merging: two lines of 60 for the same variant are 120 units
+    // of one thing, and must be refused exactly like a single line of 120.
+    if (line.quantity > MAX_LINE_QUANTITY) {
+      throw new CartValidationError(
+        `Quantity for one item cannot exceed ${MAX_LINE_QUANTITY}`,
+        "LINE_QUANTITY_EXCEEDED",
+        {
+          productId: line.productId,
+          variantId: line.variantId,
+          quantity: line.quantity,
+          max: MAX_LINE_QUANTITY,
+        },
+      );
+    }
+  }
+
+  return lines;
+}
+
+/** Distinct product ids in the basket, first-appearance order. */
+export function productIdsOf(lines: CartLine[]): string[] {
+  return [...new Set(lines.map((l) => l.productId))];
+}
+
+/** Distinct variant ids in the basket, first-appearance order. */
+export function variantIdsOf(lines: CartLine[]): string[] {
+  return [
+    ...new Set(
+      lines.map((l) => l.variantId).filter((id): id is string => id != null),
+    ),
+  ];
+}
+
+/**
+ * Total ordered quantity per product across the whole basket.
+ *
+ * This is what an offer's triggerQuantity is tested against: two lines of the
+ * same product in different variants are three units of that product, and a
+ * "buy 3" offer should fire.
+ */
+export function quantityByProduct(lines: CartLine[]): Map<string, number> {
+  const totals = new Map<string, number>();
+  for (const line of lines) {
+    totals.set(line.productId, (totals.get(line.productId) ?? 0) + line.quantity);
+  }
+  return totals;
+}

@@ -1,0 +1,58 @@
+{
+  "header": {
+    "title": "Accueil"
+  },
+  "stats": {
+    "needs_attention": "À traiter",
+    "needs_attention_hint": "Colis signalés, annulés ou non confirmés par un transporteur",
+    "delivery_success": "Taux de livraison",
+    "delivered_count_one": "{count} livrée",
+    "delivered_count_many": "{count} livrées",
+    "delivered_count_other": "{count} livrées",
+    "returned_count_one": "{count} retournée",
+    "returned_count_many": "{count} retournées",
+    "returned_count_other": "{count} retournées"
+  },
+  "recent_orders": {
+    "title": "Commandes récentes",
+    "new_order": "Nouvelle commande",
+    "view_all": "Voir tout",
+    "empty": "Aucune commande pour le moment"
+  },
+  "queues": {
+    "title": "Où en sont vos commandes",
+    "subtitle": "Chaque commande, selon son étape",
+    "total_one": "{count} commande",
+    "total_many": "{count} commandes",
+    "total_other": "{count} commandes"
+  },
+  "next": {
+    "attention_one": "{count} commande a besoin de vous",
+    "attention_many": "{count} commandes ont besoin de vous",
+    "attention_other": "{count} commandes ont besoin de vous",
+    "to_confirm_one": "{count} commande attend un appel",
+    "to_confirm_many": "{count} commandes attendent un appel",
+    "to_confirm_other": "{count} commandes attendent un appel",
+    "to_ship_one": "{count} commande est prête à expédier",
+    "to_ship_many": "{count} commandes sont prêtes à expédier",
+    "to_ship_other": "{count} commandes sont prêtes à expédier",
+    "clear": "Rien ne vous attend pour le moment"
+  },
+  "performance": {
+    "order_value": "Valeur des commandes",
+    "orders": "Commandes",
+    "average": "Panier moyen",
+    "period": "Période",
+    "range_one": "{count} dernier jour",
+    "range_many": "{count} derniers jours",
+    "range_other": "{count} derniers jours",
+    "compared_one": "par rapport au jour précédent",
+    "compared_many": "par rapport aux {count} jours précédents",
+    "compared_other": "par rapport aux {count} jours précédents",
+    "up": "En hausse de {value} %",
+    "down": "En baisse de {value} %",
+    "flat": "Stable",
+    "caption": "{metric}, {range}",
+    "empty": "Aucune commande sur cette période"
+  }
+}

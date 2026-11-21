@@ -1,0 +1,208 @@
+---
+description: Every public export of @wocart/storefront, grouped by entry point — root, /server, /astro and /review-media.
+---
+
+import { Callout } from "zudoku/ui/Callout";
+
+# Public API surface
+
+The curated map of `@wocart/storefront` 3.1.0. The
+[generated reference](/sdk/storefront/reference/README) has every signature; this
+page groups the surface by entry point and says what runs where.
+
+```sh
+npm install --save-exact @wocart/storefront@3.1.0
+npm install zod
+```
+
+| Import | Runs in | Holds |
+| --- | --- | --- |
+| `@wocart/storefront` | Browser and server | Types, Zod schemas, money and image helpers, routes, languages, basket, OTP, geography, phone, coupon and Meta helpers |
+| `@wocart/storefront/server` | Server only | `createStoreClient`, the error type, preview and revalidation |
+| `@wocart/storefront/astro` | Server only | The request's store and language, same-origin routes, the proxy endpoint, the place-order engine, the form-action middleware |
+| `@wocart/storefront/review-media` | Browser only | Photo resizing and voice recording for a review form |
+
+<Callout type="caution" title="One boundary, enforced by review">
+The root entry builds no schema at import in the modules a browser uses, but it
+does export schemas — importing `ProductSchema` in a page script ships Zod to
+every shopper. Browser code imports helpers and types; validation stays on the
+server, where data enters.
+</Callout>
+
+## Money, images and presentation
+
+| Export | What it does |
+| --- | --- |
+| `formatMoney(amount, { symbol, locale, decimals? })` | The amount in the locale's digits, the symbol after it; zero decimals by default |
+| `mediaUrl(key, delivery)` | A media **key** → its URL in the store's media, or `null` (no delivery, or not a key) |
+| `mediaImageUrl(url, params, delivery)` | The photo at a size, from the delivery's resizer (ImageKit or Cloudflare); `null` for a `direct` delivery or a URL it does not serve |
+| `mediaImageSrcset(src, widths, { delivery, ratio?, quality? })` | A `srcset` by width; `null` when the photo cannot be resized |
+| `pictureOf(image, delivery)` | A merchant-picked image → `{ src, alt, width, height, position }`, the focal point as `object-position` |
+| `isMediaKey(value)` | Whether a value is a media key (`products/…`, `landing/…`, `reviews/…`) |
+| `productImageSource(product)` | The product's representative image URL: its cover, else its first gallery image, else `null` |
+| `getProductView(product)`, `getProductListView(product)` | Price, default variant, discount percentage, stock state, for a product or a listed product |
+| `productMeta(product)`, `SEO_TEXT_LIMITS` | A product's title and description for search engines: what the merchant wrote, else its name and plain description |
+| `productStructuredData(product, { url, storeName? })`, `jsonLd(value)` | Its schema.org `Product`, and the text of a JSON-LD script that can never end the script |
+| `canonicalUrl(origin, { pathname, locale, routing }, search?)` | A page's canonical address: its path in its language and its listing page, nothing else |
+| `getOfferTierView(offer, basePrice, comparePrice)`, `getQuantityTierViews(pricing, unitPrice)` | An offer's tile, and the quantity-price tiers, for display |
+| `initialVariant(product)`, `optionStates(product, selection)`, `pickOption(product, selection, option, value)`, `variantFor(variants, selection)` | Variant selection as a state machine |
+| `countdownTarget(mode, endsOn, endsAt)`, `countdownEnd(ends, now?)`, `timeLeft(end, now?)` | An offer countdown's end (every midnight, or a day the merchant names), in Algiers time, the same on the server and in the browser |
+| `whatsAppContact(config, page, words)` | The store's WhatsApp on one page: the `wa.me` link with the page's message, every text resolved; `null` when the store has none |
+| `MAX_RESOLVED_PREFILL_LENGTH`, `PREFILL_TOKENS` | The message's 900-character cap and its tokens (`product`, `url`, `order`, `store`) |
+| `storefrontTracking()` | The page's tracking: `start()`, `productViewed`, `addedToCart`, `checkoutStarted` — every event at the page's one pixel; `trackingHead` and `conversionTag` (in `@wocart/storefront/astro`) render what it reads |
+
+## The store, its pages and its languages
+
+| Export | What it does |
+| --- | --- |
+| `unavailableStoreConfig({ serverUrl, locale? })` | The config a page renders when the store cannot be read: empty `id`, nothing to buy, one language |
+| `STOREFRONT_PAGE_PATHS` | Every page type's path: `home` `/`, `catalog` `/products`, `category` `/category/:slug`, `collection` `/collections/:handle`, `product` `/products/:handle`, `page` `/pages/:slug`, `landing` `/lp/:slug`, `checkout` `/checkout`, `thankYou` `/thank-you`, `trackOrder` `/track-order`, `search` `/search`, `contact` `/contact` |
+| `storefrontPath(type, params?)` | Build one; throws when a required parameter is missing |
+| `matchStorefrontPath(pathname)` | Which page type a pathname is, with its decoded parameter, or `null` |
+| `showsWidgetOn(surfaces, pathname)` | Whether the floating WhatsApp launcher belongs on this path |
+| `SINGLE_LANGUAGE_PAGE_TYPES`, `isSingleLanguagePage(pathname)` | The page types that exist in the primary language only (`["landing"]`), and whether a path is one |
+| `STOREFRONT_API_PATHS`, `storefrontApiPath(name, params?)` | Where each of `createStorefrontRoutes`' routes is mounted (`/api/communes/:wilayaId` …), and one path with its parameter filled |
+| `thankYouHref(order, language?)`, `readThankYou(url)` | The thank-you page's address for a placed order (`?order=&total=&oid=`), in the shopper's language, and its reading back |
+| `servedLanguage(config, code?)`, `localeRouting(config)`, `resolveLocalePath(pathname, routing)`, `localizeHref(href, locale, routing)`, `alternateLinks(pathname, routing, origin)` | Language-prefixed URLs: the primary language unprefixed, every other published language under its code |
+
+## Basket and checkout
+
+| Export | What it does |
+| --- | --- |
+| `createBasketStore(options)` | The browser basket: storage adapter, listeners, line caps |
+| `createLocalStorageAdapter()`, `createMemoryStorageAdapter()` | Persist in `localStorage`, or in memory for tests and private modes |
+| `DEFAULT_BASKET_STORAGE_KEY`, `MAX_BASKET_LINES`, `MAX_BASKET_LINE_QUANTITY`, `basketLineKey(productId, variantId)` | The storage key, the caps, and how two lines are told apart |
+| `toOrderItems(lines)` | Basket lines as the server's `items[]` |
+| `addedLines(before, after)` | What an add put in the basket — for `AddToCart`; empty when the basket had no room |
+| `createOtpMachine(...)`, `createOtpTransport(...)`, `mapOtpResponse(...)`, `otpTransportFailure(...)` | Phone verification: states, transport, response mapping, a transport-level failure |
+| `createAbandonedCheckoutTracker(ports)` | Report an unfinished checkout, then its conversion |
+| `createBrowserAbandonedCheckoutTracker({ endpoint })`, `convertAbandonedCheckout(...)`, `ABANDONED_CHECKOUT_SESSION_KEY` | The same tracker wired to a browser page, and the thank-you page's conversion |
+| `bindCheckoutKey(form)` | One checkout attempt, one order: the key a checkout form's submissions carry |
+| `readShippingRates(value)`, `readCouponOutcome(value)` | Read a page's embedded rates or a quote's coupon outcome in the browser, without Zod |
+| `createQuoter({ endpoint })`, `readCartQuote(value)` | Ask the quote from the browser, keeping only the latest answer; read one without Zod |
+| `couponRefusalTone(reason)`, `COUPON_REFUSAL_REASONS`, `COUPON_HINT_REASONS` | Whether a code's refusal is a hint about the basket or a refusal of the code |
+| `isOrderNumber(value)`, `ORDER_NUMBER_PATTERN` | The shape of an order number (`ORD-20261023-0042`) |
+| `REVIEW_REFUSAL_CODES`, `REVIEW_TEXT_LIMITS` | Every refusal a review can meet, and its title and body lengths |
+| `PRODUCT_SORTS`, `SHOPPER_ORDER_STAGES`, `SHOPPER_ORDER_JOURNEY`, `DEFAULT_COLLECTION_HANDLES` | A listing's orders; an order's stages and the journey a progress bar shows; the collections every store starts with |
+| `isWilayaId(value)`, `WILAYAS`, `ALGERIA_COMMUNES`, `communesForWilaya(id)`, `normalizeAlgerianPhone(phone)`, `toLocalAlgerianMobile(phone)` | Geography and phone helpers, no network: safe in a browser script |
+| `couponFromUrl(url)`, `couponRefusalOf(result)`, `COUPON_URL_PARAM`, `COUPON_NOT_APPLICABLE` | A coupon code carried in a `URL` object, and the refusal a write result carries |
+| `STOREFRONT_OPERATIONS`, `STOREFRONT_RETRY_POLICIES` | The operation names every error carries, and each one's retry policy |
+
+## The client, namespace by namespace
+
+`createStoreClient(scope)` returns these; it is server-only and takes
+`{ serverUrl, apiKey, theme?, locale?, onError?, readTimeoutMs? }`. Every read
+is bounded by `readTimeoutMs` (10 seconds unless set).
+
+| Namespace | Methods | A failed call returns |
+| --- | --- | --- |
+| `config` | `get()` | `null` |
+| `products` | `get(handle)`, `list(filters?)`, `page(filters?)`, `search(text, filters?)` | `null` / `[]` / `{ items: [], hasNext: false, total: 0 }` |
+| `products.reviews` | `list(productId, pagination?)`, `eligibility(input)`, `upload(input)`, `submit(input)` | `{ rows: [], total: 0 }` for the read; a `ClientResult` for the writes |
+| `collections` | `get(handle)` | `null` |
+| `categories` | `list()` | `[]` |
+| `pages` | `get(slug)`, `landing(slug, { preview? })` | `null` |
+| `menus` | `get(handle)` | `null` |
+| `pageData` | `get(surface)` | `null` |
+| `shipping` | `rates()`, `rate(wilayaId)` | `{}` / `null` |
+| `geo` | `wilayas()` (built-in data, never fails), `communes(wilayaId)` | `[]` |
+| `cart` | `validate(items, options?)`, `quote(lines, options?)` | a `ClientResult` |
+| `orders` | `create(input)`, `tracking(orderId)`, `status(proof)`, `abandoned.upsert(input)`, `abandoned.convert(input)`, `otp.send(input)`, `otp.verify(input)` | a `ClientResult` (tracking: `null`) |
+
+The read contract is the SDK's most important promise: a failed read degrades to
+an empty value and reports through `onError`; it never throws. A write returns
+`ClientResult` — `{ success: true, data }` or `{ success: false, domainError }` —
+because a refusal is an expected answer, not an exception.
+
+## Schemas and types
+
+The root entry exports the Zod schemas the client validates with, for a script
+or a route that needs the same shape:
+
+- **Catalog**: `ProductSchema`, `ProductListSchema`, `ProductImageSchema`,
+  `ProductVariantSchema`, `OfferSchema`, `QuantityPricingSchema`,
+  `CategorySchema`, `StoreCollectionSchema`, `StoreMenuSchema`,
+  `StoreMenuItemSchema`.
+- **Store**: `StoreConfigSchema`, `StorefrontLanguageSchema`,
+  `StorePagePublicSchema`, `StorePageLinkSchema`, `StoreContactSchema`,
+  `CheckoutFormPolicySchema`, `CheckoutFormCustomFieldSchema`,
+  `StoreWhatsAppWidgetSchema`, `LandingPageSchema`, `LandingPageImageSchema`,
+  `PageDocumentPayloadSchema`, `MediaImageSchema`, `MediaDeliverySchema`.
+- **Commerce**: `ShippingRatesSchema`, `WilayaRatesSchema`, `CommuneSchema`,
+  `CartValidationSchema`, `CartValidationLineSchema`, `CartRewardSchema`,
+  `CouponOutcomeSchema`, `CreatedOrderSchema`, `OrderTrackingSchema`,
+  `ReviewSchema`, `ReviewMediaSchema`, `ReviewEligibilitySchema`,
+  `ReviewUploadSchema`, `ReviewSubmitResultSchema`, `ReviewListEnvelopeSchema`,
+  `OtpSendResultSchema`, `OtpVerifyResultSchema`, `IdResponseSchema`,
+  `ProductPageEnvelopeSchema`, `ShopperOrderStatusSchema`.
+- **Input**: `BasketSchema`, `BasketLineSchema`, `BasketLineInputSchema`,
+  `AbandonedCheckoutInputSchema`, `AbandonedBasketLineSchema`,
+  `ProductQuoteInputSchema`, `CartQuoteLinesSchema`, `DeliveryDestinationSchema`,
+  `DeliverySelectionSchema`, `OtpProofSchema`, `OrderSchema`,
+  `TrackingDecisionSchema`, `WilayaIdSchema`.
+
+The types a theme names most: `StoreConfig`, `StorefrontLanguage`, `Product`,
+`ProductList`, `ProductDetail`, `Category`, `StoreCollection`, `StoreMenu`,
+`StorePagePublic`, `LandingPage`, `CartValidation`, `CartQuoteOptions`,
+`CreatedOrder`, `OrderTracking`, `Review`, `ReviewEligibility`, `Wilaya`,
+`Commune`, `DomainError`, `ClientResult`, `StoreScope`, `ProductPage`,
+`ProductView`, `BasketStore`, `OtpMachine`, `MetaPixelTracker`, `MediaImage`,
+`MediaDelivery`, `StoreContact`, `WhatsAppContact`, `WhatsAppPage`,
+`WhatsAppWords`.
+
+## `@wocart/storefront/server`
+
+| Export | What it does |
+| --- | --- |
+| `createStoreClient(scope)` | The one client factory; throws at construction on an empty `serverUrl` or `apiKey` |
+| `StoreClient`, `ClientResult` | Its type, and the write result type |
+| `PreviewClaims`, `PreviewDraft`, `PreviewRequest`, `RevalidateClaims`, `RevalidateRequest` | What the preview and revalidation readers answer |
+| `StorefrontError`, `isStorefrontError(error)` | The error type, and the narrow check |
+| `readPreviewRequest(request, { publicKey, theme })`, `verifyPreviewToken(token, options)`, `previewConfig(config, draft)`, `previewResponseHeaders(claims)` | An editor's preview request: verified claims, the draft's config, and the headers that keep it out of a cache |
+| `REVALIDATE_PATH`, `readRevalidateRequest(request, options)`, `PAGES_CACHE_TAG` | The publish hook's path (`/wocart-revalidate`), its verified request, and the cache tag (`"pages"`) every cached page carries |
+| `catalogPaths(client, config)`, `sitemapXml(paths, routing, origin)` | Every page a sitemap lists, and the sitemap in every published language |
+
+## `@wocart/storefront/astro`
+
+| Export | What it does |
+| --- | --- |
+| `createStorefrontMiddleware(options)` | A theme's whole middleware: store and language, redirects, a 404 that keeps the language, the editor's preview, the form action |
+| `revalidateEndpoint({ publicKey, theme })` | The `/wocart-revalidate` route, `{ POST, ALL }`: drops every page under `PAGES_CACHE_TAG` for a verified token |
+| `createStorefrontRoutes({ client })` | The same-origin routes: `otpSend`, `otpVerify`, `cartValidate`, `abandonedUpsert`, `abandonedConvert`, `communes`, `reviewsList`, `reviewEligibility`, `reviewUpload`, `reviewSubmit`, `orderStatus` |
+| `REVIEWS_PAGE_DEFAULT`, `REVIEWS_PAGE_MAX` | 20 and 50 — the reviews route's page bounds |
+| `createProxyEndpoint(config)` | A generic same-origin proxy for what the routes above do not cover |
+| `placeOrderInput` | The order form's input whitelist (a Zod object) |
+| `executePlaceOrder(input, request, client)` | The order engine: basket-or-product rule, attribution, the wire body |
+| `collectForwardedHeaders(request)` | The headers a route forwards to the server |
+| `runFormAction(deps)` | The form-action middleware step: runs a form-posted action so the page renders its result in place |
+| `resolveStoreRequest(request, options)`, `resolvePreviewStore(draft, options)` | Which store and language a request renders, and the redirects; an editor's draft's store |
+| `notFound(context, page?)` | A missing resource: the 404 page, status 404, never cached |
+| `lookupOrder(input, request, client)`, `orderLookupInput` | A shopper's order lookup for a track-order form, its outcome worded in a few cases |
+| `PlaceOrderInput`, `PlaceOrderResult`, `OrderLookup`, `OrderLookupInput`, `ResolvedStore`, `StoreRequestOptions`, `StoreRequestResolution`, `NotFoundContext`, `ActionDescriptor`, `ActionMiddlewareDeps`, `ProxyEndpointConfig`, `ProxyClientFn`, `AstroAPIContext`, `AstroAPIRoute`, `StorefrontApiRoute`, `StorefrontRoutes`, `StorefrontRoutesOptions`, `PreviewLocals`, `StorefrontMiddleware`, `StorefrontMiddlewareContext`, `StorefrontMiddlewareOptions`, `StorefrontActionContext`, `RevalidateEndpointContext`, `RevalidateEndpointOptions` | The types those take and return |
+
+## `@wocart/storefront/review-media`
+
+| Export | What it does |
+| --- | --- |
+| `prepareReviewPhoto(photo, options?, deps?)` | Shrink a photo to 1600 px at most and re-encode it (WebP, else JPEG); the re-encode drops EXIF |
+| `createReviewSession({ routes, attempts? }, deps?)` | The review form's whole conversation: find the order, send each file with progress and retries, submit |
+| `photoTargetSize(width, height, maxEdge)` | The size the photo is drawn at |
+| `createVoiceRecorder(options, deps?)`, `canRecordVoice(deps?)` | Record a voice note at a low bitrate, stopping at the store's limit |
+| `pickVoiceMimeType(isTypeSupported)`, `VOICE_MIME_TYPES` | The container/codec the browser supports, in preference order |
+| `PhotoOptions`, `PhotoDeps`, `RecordedVoice`, `VoiceRecorderOptions`, `VoiceRecorder`, `VoiceDeps`, `ReviewSession`, `ReviewSessionOptions`, `ReviewSessionRoutes`, `ReviewSessionDeps`, `ReviewDraft`, `ReviewFindResult`, `ReviewRefusal`, `ReviewSubmission`, `ReviewUpload`, `ReviewUploadOptions`, `ReviewUploadRequest`, `ReviewUploadResult` | The option, session and injection types |
+
+Each takes its browser dependencies as an optional last argument, so it can run
+in a test with a stub canvas or recorder.
+
+<Callout type="caution" title="What is not public">
+`dist/…` and `src/…` deep paths may move in any release. The client's internal
+core, its caches and its transport are not part of the contract; if the public
+surface is missing something a storefront needs, that is an SDK change, not a
+deep import.
+</Callout>
+
+## Version
+
+This guide follows `@wocart/storefront` 3.1.0 with `zod` 4.x (a peer), which
+reads platform v7. Pin exact versions and read the package's `CHANGELOG.md`
+before upgrading; see [Testing a storefront](/sdk/storefront/testing#compatibility).

@@ -1,0 +1,49 @@
+# CodFlow server — local development secrets
+# Copy this file to .dev.vars and fill in your values.
+# (.dev.vars is gitignored — your real values never get committed.)
+
+# ── Required for local dev ────────────────────────────────────────────────────
+
+# Used by the storefront (cod-astro) and dashboard to authenticate against the
+# server's store API. Generate one with:  openssl rand -hex 32
+# It is hashed with SHA-256 before storage (see scripts/seed-store.ts).
+# STORE_API_KEY=
+
+# ── Media on ImageKit, locally (optional) ─────────────────────────────────────
+# Out of the box, local media is kept in the local bucket and served by this
+# server (wrangler.toml [vars]). To keep it on your ImageKit account instead
+# (ImageKit → Developer options; the private key is a secret):
+# MEDIA_HOST=imagekit
+# MEDIA_DELIVERY=imagekit
+# IMAGEKIT_PUBLIC_KEY=public_…
+# IMAGEKIT_PRIVATE_KEY=private_…
+# IMAGEKIT_FOLDER=/dev/your-name
+# MEDIA_ORIGIN=https://ik.imagekit.io/your_imagekit_id/dev/your-name
+
+# ── Optional overrides ────────────────────────────────────────────────────────
+# Overrides the [vars] block in wrangler.toml for local runs if you need to test
+# MCP token verification against a live dashboard, or a different environment:
+# ENVIRONMENT=development
+# BETTER_AUTH_URL=http://localhost:4321/api/auth
+# WORKER_SELF_URL=http://localhost:8787/
+# WORKER_URL=http://localhost:8787
+
+# ── Telegram App, on a local server ───────────────────────────────────────────
+# Telegram calls the server back with the bot's updates (pairing, blocks) and
+# cannot reach localhost. Run a tunnel (cloudflared tunnel --url
+# http://localhost:8787) and put its https origin here; WORKER_SELF_URL stays
+# as it is, since the dashboard's sign-in is checked against it.
+# TELEGRAM_UPDATES_ORIGIN=https://<name>.trycloudflare.com
+
+# ── MCP sign-in ───────────────────────────────────────────────────────────────
+# HMAC key shared with the Astro dashboard for MCP OAuth login tickets
+# (must be >= 32 bytes). Set the SAME value on cod-client-astro. Generate with:
+#   openssl rand -hex 32
+# MCP_LOGIN_TICKET_SECRET=
+
+# HMAC key that signs review upload grants (photos and voice notes with
+# storefront reviews; must be >= 32 bytes). Without it, reviews are text only.
+# Generate with:  openssl rand -hex 32
+# REVIEW_UPLOAD_SECRET=
+
+# In production all values are set with `wrangler secret put`, never in code.

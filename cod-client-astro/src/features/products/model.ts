@@ -1,0 +1,297 @@
+import type { Translate } from "@/i18n/core";
+import type { Consequence } from "@/components/ui/confirm-dialog";
+import type { Product, ProductRemoval, ProductStatus, StockAlertItem, StockMovement, VariantOption, VariantOptionFormState } from "./types";
+import { SEO_TEXT } from "../../../../cod-shared/lib/seo";
+
+export type ProductSortKey = "name" | "price" | "totalInventory" | "createdAt";
+
+export type ProductRoute =
+  | { kind: "list" }
+  | { kind: "new" }
+  | { kind: "stock" }
+  | { kind: "detail"; id: string }
+  | { kind: "edit"; id: string }
+  | { kind: "unknown" };
+
+export interface ProductFilters {
+  query: string;
+  category: string;
+  status: ProductStatus | "all";
+}
+
+/**
+ * An update only changes what it carries: a key that is left out means "keep
+ * what is stored", and `null` means "clear it". So a field the merchant has
+ * emptied must travel as `null` when editing — dropping the key would silently
+ * keep the old value. A create has nothing stored, so an empty field is simply
+ * left out (the create schema does not take null).
+ */
+export function optionalMoney(value: string, editing: boolean): number | null | undefined {
+  if (value.trim() === "") return editing ? null : undefined;
+  return Math.round(Number(value));
+}
+
+export function optionalId(value: string, editing: boolean): string | null | undefined {
+  if (value === "") return editing ? null : undefined;
+  return value;
+}
+
+const EMPTY_EDITOR_MARKUP = /^(<p>(\s|<br\s*\/?>|&nbsp;)*<\/p>)?$/i;
+
+/** An empty rich-text editor holds `<p></p>`; that is no description, and must not be stored as one. */
+export function optionalDescription(value: string, editing: boolean): string | undefined {
+  if (EMPTY_EDITOR_MARKUP.test(value.trim())) return editing ? "" : undefined;
+  return value;
+}
+
+export const PRODUCT_STATUSES: ProductStatus[] = ["ACTIVE", "DRAFT", "ARCHIVED"];
+
+export function productStockTone(product: Pick<Product, "trackInventory" | "totalInventory" | "inventory">) {
+  const total = product.totalInventory ?? product.inventory ?? 0;
+  if (!product.trackInventory) return "none" as const;
+  if (total === 0) return "out" as const;
+  return "ok" as const;
+}
+
+export function filterProducts(products: Product[], filters: ProductFilters) {
+  const q = filters.query.trim().toLocaleLowerCase();
+  return products.filter((product) => {
+    if (filters.category !== "all" && product.categoryId !== filters.category) return false;
+    if (filters.status !== "all" && product.status !== filters.status) return false;
+    if (q && `${product.name} ${product.sku ?? ""} ${product.handle}`.toLocaleLowerCase().indexOf(q) === -1) return false;
+    return true;
+  });
+}
+
+export function sortProducts(products: Product[], key: ProductSortKey, direction: "asc" | "desc") {
+  return [...products].sort((left, right) => {
+    const leftValue = left[key] ?? 0;
+    const rightValue = right[key] ?? 0;
+    const comparison = typeof leftValue === "number" && typeof rightValue === "number"
+      ? leftValue - rightValue
+      : String(leftValue).localeCompare(String(rightValue), undefined, { numeric: true, sensitivity: "base" });
+    return direction === "asc" ? comparison : -comparison;
+  });
+}
+
+export function paginateProducts(products: Product[], page: number, pageSize: number) {
+  const safePage = Math.max(1, page);
+  const safePageSize = Math.max(1, pageSize);
+  return products.slice((safePage - 1) * safePageSize, safePage * safePageSize);
+}
+
+export function parseProductRoute(pathname: string): ProductRoute {
+  const path = pathname.replace(/\/+$/, "") || "/";
+  if (path === "/products") return { kind: "list" };
+  if (path === "/products/new") return { kind: "new" };
+  if (path === "/products/stock") return { kind: "stock" };
+  const match = path.match(/^\/products\/([^/]+)(\/edit)?$/);
+  if (!match) return { kind: "unknown" };
+  try {
+    const id = decodeURIComponent(match[1]);
+    if (!id || id === "new" || id === "stock") return { kind: "unknown" };
+    return match[2] ? { kind: "edit", id } : { kind: "detail", id };
+  } catch {
+    return { kind: "unknown" };
+  }
+}
+
+interface ApiLikeError {
+  code?: string;
+  status?: number;
+  context?: Record<string, unknown>;
+}
+
+function asApiError(cause: unknown): ApiLikeError | null {
+  if (!cause || typeof cause !== "object") return null;
+  const candidate = cause as ApiLikeError;
+  return typeof candidate.code === "string" ? candidate : null;
+}
+
+/** A product without options is ordered by its own SKU: without one, the store refuses its orders. */
+export function needsSku(product: Pick<Product, "hasVariants" | "sku">): boolean {
+  return !product.hasVariants && !product.sku;
+}
+
+export function productErrorMessage(cause: unknown, t: Translate) {
+  const api = asApiError(cause);
+  const code = api?.code ?? "";
+  const context = api?.context;
+
+  if (code === "PRODUCT_NOT_FOUND") return t("error_not_found");
+  if (code === "INSUFFICIENT_STOCK") return t("error_insufficient_stock");
+
+  if (code === "DUPLICATE_SKU") {
+    const sku = typeof context?.sku === "string" ? context.sku : null;
+    return sku
+      ? t("error_duplicate_sku_named", { sku })
+      : t("error_duplicate_sku");
+  }
+
+  if (code === "VALIDATION_FAILED") {
+    const fields = Array.isArray(context?.fields) ? context!.fields : [];
+    if (fields.some((field) => (field as { path?: string }).path === "sku")) return t("form.error_sku_required");
+    const lines = fields
+      .map((field) => {
+        const entry = field as { path?: string; message?: string };
+        return entry.path ? `${entry.path}: ${entry.message ?? ""}` : entry.message ?? "";
+      })
+      .filter(Boolean);
+    return lines.length
+      ? `${t("error_validation")} — ${lines.join(" · ")}`
+      : t("error_validation");
+  }
+
+  if (code === "INTERNAL_SERVER_ERROR" || (api?.status ?? 0) >= 500) {
+    const requestId =
+      typeof context?.requestId === "string" ? context.requestId : null;
+    return requestId
+      ? t("error_unexpected_id", { id: requestId })
+      : t("error_generic");
+  }
+
+  return t("error_generic");
+}
+
+export function generateCombinations(options: VariantOptionFormState[]): Array<{ key: string; variations: Record<string, string> }> {
+  const valid = options.filter((option) => option.name.trim() && option.values.some((value) => value.value.trim()));
+  if (!valid.length) return [];
+  let result: Record<string, string>[] = [{}];
+  for (const option of valid) {
+    const values = option.values.filter((value) => value.value.trim());
+    result = result.flatMap((existing) => values.map((value) => ({ ...existing, [option.name]: value.value })));
+  }
+  return result.map((variations) => ({ key: Object.values(variations).join(" / "), variations }));
+}
+
+export function variantLabel(variations: Record<string, string>) {
+  return Object.entries(variations).map(([, value]) => value).join(" / ");
+}
+
+export function toSlug(name: string) {
+  return name.toLocaleLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9-]/g, "").replace(/-+/g, "-");
+}
+
+export function calcMargin(price: string, cost: string) {
+  const base = Number(price);
+  const costValue = Number(cost);
+  if (!base || !costValue || costValue >= base) return null;
+  return Math.round(((base - costValue) / base) * 100);
+}
+
+export function formatMoneyValue(amount: number, locale: "ar" | "en" | "fr", currency = "DA") {
+  return `${new Intl.NumberFormat(locale === "ar" ? "ar-DZ" : `${locale}-DZ`).format(amount)} ${currency}`;
+}
+
+export function stockAlertTone(item: StockAlertItem): "out" | "low" | "ok" {
+  if (item.isOutOfStock) return "out";
+  if (item.inventory <= item.lowStockThreshold) return "low";
+  return "ok";
+}
+
+export function groupStockByProduct(items: StockAlertItem[]) {
+  const map = new Map<string, { productId: string; productName: string; items: StockAlertItem[] }>();
+  for (const item of items) {
+    const existing = map.get(item.productId);
+    if (existing) existing.items.push(item);
+    else map.set(item.productId, { productId: item.productId, productName: item.productName, items: [item] });
+  }
+  return Array.from(map.values());
+}
+
+export type StockGroup = ReturnType<typeof groupStockByProduct>[number];
+
+export type StockSortKey = "inventory" | "name" | "updatedAt";
+
+export const STOCK_SORT_KEYS: StockSortKey[] = ["inventory", "name", "updatedAt"];
+
+export function filterStockItems(items: StockAlertItem[], query: string) {
+  const q = query.trim().toLocaleLowerCase();
+  if (!q) return items;
+  return items.filter((item) =>
+    `${item.productName} ${item.variantLabel ?? ""} ${item.sku ?? ""}`.toLocaleLowerCase().includes(q),
+  );
+}
+
+function compareText(left: string, right: string) {
+  return left.localeCompare(right, undefined, { numeric: true, sensitivity: "base" });
+}
+
+function compareStockItems(left: StockAlertItem, right: StockAlertItem, key: StockSortKey) {
+  if (key === "inventory") return left.inventory - right.inventory;
+  if (key === "updatedAt") return compareText(left.updatedAt, right.updatedAt);
+  return compareText(
+    `${left.productName} ${left.variantLabel ?? ""}`,
+    `${right.productName} ${right.variantLabel ?? ""}`,
+  );
+}
+
+export function sortStockItems(items: StockAlertItem[], key: StockSortKey, direction: "asc" | "desc") {
+  const sign = direction === "asc" ? 1 : -1;
+  return [...items].sort((left, right) => sign * compareStockItems(left, right, key));
+}
+
+export function stockGroupInventory(group: StockGroup) {
+  return group.items.reduce((total, item) => total + item.inventory, 0);
+}
+
+/** Most recent write across the group's SKUs — what "sort by date" ranks a product on. */
+export function stockGroupUpdatedAt(group: StockGroup) {
+  return group.items.reduce((latest, item) => (item.updatedAt > latest ? item.updatedAt : latest), "");
+}
+
+export function movementIsStockIn(type: StockMovement["type"]) {
+  return ["PURCHASE", "ADJUSTMENT_ADD", "ORDER_CANCELLED", "ORDER_RETURNED"].includes(type);
+}
+
+/** Compact row-sized date for the stock table — "15 Jan 2025". */
+export function formatStockDate(value: string, locale: "ar" | "en" | "fr") {
+  const date = new Date(value);
+  if (!value || Number.isNaN(date.getTime())) return null;
+  return new Intl.DateTimeFormat(locale === "ar" ? "ar-DZ" : `${locale}-DZ`, { year: "numeric", month: "short", day: "numeric" }).format(date);
+}
+
+export function apiVariantOptions(options: VariantOptionFormState[]): VariantOption[] {
+  return options
+    .filter((option) => option.name.trim())
+    .map((option) => ({
+      name: option.name.trim(),
+      values: option.values.filter((value) => value.value.trim()).map((value) => ({ value: value.value.trim(), hexColor: value.hexColor || null })),
+    }));
+}
+
+/** What removing a product takes away, what stays, and what to watch — in the merchant's words, from the server's reading. */
+export function productRemovalConsequences(removal: ProductRemoval, t: Translate): Consequence[] {
+  const removed = (key: string, count: number): Consequence[] => (count > 0 ? [{ text: t(`removal.${key}`, { count }) }] : []);
+  return [
+    { text: t("removal.product") },
+    ...removed("variants", removal.variants),
+    ...removed("images", removal.images),
+    ...removed("reviews", removal.reviews),
+    ...removed("offers", removal.offers),
+    ...removed("landing_pages", removal.landingPages),
+    ...(removal.orderLines > 0 ? [{ text: t("removal.order_lines_kept", { count: removal.orderLines }), kept: true }] : []),
+    ...(removal.landingPageOrders > 0 ? [{ text: t("removal.landing_orders_kept", { count: removal.landingPageOrders }), kept: true }] : []),
+    ...(removal.ordersToShip > 0 ? [{ text: t("removal.orders_to_ship", { count: removal.ordersToShip }), warning: true }] : []),
+  ];
+}
+
+/**
+ * What a search result shows for a product: its search-engine title and
+ * description, else its name and its description as text, shortened as the
+ * storefront shortens it.
+ */
+export function searchListing(product: { metaTitle: string; metaDescription: string; name: string; description: string }): { title: string; description: string } {
+  const title = product.metaTitle.trim() || product.name.trim();
+  const written = product.metaDescription.trim();
+  if (written) return { title, description: written };
+  const text = product.description.replace(/<[^>]*>/g, " ").replace(/&nbsp;/g, " ").replace(/\s+/g, " ").trim();
+  return { title, description: shorten(text, SEO_TEXT.descriptionMax) };
+}
+
+function shorten(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const cut = text.slice(0, max - 1);
+  const space = cut.lastIndexOf(" ");
+  return `${(space > max / 2 ? cut.slice(0, space) : cut).trimEnd()}…`;
+}

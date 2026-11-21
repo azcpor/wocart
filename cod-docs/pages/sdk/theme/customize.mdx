@@ -1,0 +1,238 @@
+---
+description: Turn the Wocart theme starter into your own theme — restyle it from one stylesheet, swap its fonts and colors, change its words and default pages, add fields and sections — without breaking Studio, right to left or checkout.
+---
+
+import { Callout } from "zudoku/ui/Callout";
+
+# Make it your own
+
+The starter ([Quick start](/sdk/theme/starter)) has a look of its own: black
+and white, a serif pair (Fraunces and Alexandria),
+crisp corners and letter-spaced buttons. All of it lives in a few files, and
+everything else reads from them, so it can take any brand. This page goes
+from the smallest change to the largest.
+
+## Restyle the whole store
+
+Three places restyle every page:
+
+1. **`src/styles/tokens.css`**, the design system: fonts, body size and
+   leading, font weights, heading and display type, button shape and
+   lettering, corners, shadows, the sale badge, motion, and the tints derived
+   from the store's colors. Every other stylesheet reads these tokens. A test
+   fails on a color, font, font weight, radius or shadow written anywhere
+   else.
+2. **The fonts** in `public/fonts/`: one Arabic family and one Latin family,
+   each limited to its script.
+3. **The starter's colors** in `src/theme/palette.ts`, which the default color
+   schemes in `src/theme/settings.ts` use: what a store
+   starts with before the merchant picks colors in Studio.
+
+A rounded, modern sans-serif look with soft pill buttons is only this in
+`tokens.css`, plus the font file, its preload and its license:
+
+```css
+@font-face {
+  font-family: "Brand";
+  src: url("/fonts/brand-latin.woff2") format("woff2");
+  font-weight: 100 900;
+  font-display: swap;
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+2000-206F, U+20AC;
+}
+
+:root {
+  --font-latin: "Brand";        /* was "Fraunces" */
+  --heading-weight: 800;        /* was 500 */
+  --display-weight: 800;        /* was 400 */
+  --weight-heavy: 800;          /* was 600 */
+  --btn-radius: var(--r-pill);  /* was var(--r-sm) */
+  --btn-case: none;             /* was uppercase */
+  --btn-tracking: 0;            /* was 0.09em */
+  --r: 16px;                    /* was 3px */
+  --r-lg: 22px;                 /* was 4px */
+  --r-pill: 999px;              /* was 2px */
+}
+```
+
+Every page follows, in both directions, and the order form, Studio's preview
+and the merchant's own colors keep working.
+
+### Type and buttons
+
+| Tokens | What they set |
+| --- | --- |
+| `--body-size`, `--body-leading` | The text size and line height of the page |
+| `--weight-medium`, `--weight-semibold`, `--weight-bold`, `--weight-heavy` | The weights every stylesheet names: a theme never writes a number |
+| `--heading-weight`, `--heading-tracking` | Headings |
+| `--display-weight`, `--display-tracking` | The hero's large title |
+| `--btn-radius`, `--btn-weight`, `--btn-size`, `--btn-case`, `--btn-tracking`, `--btn-glow` | Every button |
+| `--sale`, `--sale-ink`, `--sticker-radius`, `--sticker-shadow`, `--sticker-rotate` | The saving badge on a card and the sticker on a product photo |
+
+The `[dir="rtl"]` block in `tokens.css` sets Arabic's own values: a larger
+body size and a taller line, its weights, and no letter-spacing or capitals,
+because Arabic letters join and spacing them apart breaks the word.
+
+### Colors
+
+A color scheme sets seven roles: `background`, `text`, `heading`, `accent`,
+`button`, `buttonText` and `border`. The starter ships four schemes
+(`light`, `muted`, `accent`, `dark`). Each section has a `scheme` field, and
+`schemeClass(id)` from `@wocart/theme` puts the scheme's colors on the
+section as `--wc-color-*` variables. In `tokens.css`, the rule
+`:root, .wc-scheme` turns them into the theme's tokens (`--bg`, `--ink`,
+`--accent`…), with the `light` scheme as the fallback values.
+
+To change the palette, edit the constants in `src/theme/palette.ts` and the fallbacks in
+`tokens.css` together. Keep the
+scheme ids: sections and documents name them. A merchant's own colors, picked
+in Studio, then replace yours store by store.
+
+### Corners and shadows
+
+The `corners` setting offers three sets: `soft` is the `:root` set in
+`tokens.css`, and `round` and `square` are the `html[data-corners=…]` rules
+under it. Shadows are `--shadow-sm`, `--shadow` and `--shadow-lg`.
+
+### Fonts
+
+- Exactly two families: one Arabic, one Latin, each with a `unicode-range`
+  for its script, so a page downloads only the one its text uses.
+- Self-hosted `.woff2` files only. A test rejects fonts loaded from Google
+  Fonts, Typekit or Bunny.
+- For each file: its `@font-face` rule in `tokens.css`, its preload in
+  `src/layouts/StoreLayout.astro`, and its license in
+  `public/fonts/OFL.txt`, naming the file. The Arabic file's name contains
+  `arabic` and the Latin one's `latin`. A test checks all of it.
+- Point `--font-arabic` and `--font-latin` at the new families.
+
+### What to keep while restyling
+
+- **Colors through tokens**, so merchants can recolor sections with schemes.
+- **Logical properties** (`margin-inline-start`, `inset-inline-end`), never
+  `left` or `right` for layout, so right to left needs no rule of its own. A
+  physical side is allowed only in a rule that names one direction
+  (`[dir="rtl"]`) or the WhatsApp widget's side, and a test checks it.
+  Directional icons carry `icon-directional`; phone and order numbers stay
+  left to right.
+- **What scripts and forms rely on**: every `name="…"` in the order form,
+  every `data-*` attribute a script reads, the `#order` anchor, and the
+  form's `action`.
+- **Studio's hooks**: keep `Sections.astro`, `Area.astro` and
+  `PreviewBridge.astro`, and render every section through
+  `src/components/ui/Section.astro`.
+- **No scoped `<style>` blocks** in components: styles live in
+  `src/styles/`.
+
+## Change the words
+
+Every word a shopper reads is a key in `src/theme/content/`, one file per
+area, with Arabic, French and English side by side:
+
+```ts
+"checkout.place": { ar: "تأكيد الطلب", fr: "Confirmer la commande", en: "Confirm my order" },
+```
+
+- Every key exists in all three languages.
+- A count is a plural message with each language's forms (Arabic has six:
+  `zero`, `one`, `two`, `few`, `many`, `other`), filled in by
+  `formatMessage`.
+- A key nothing reads is removed, and the browser receives only the keys in
+  `src/lib/browser-copy.ts`.
+- Markup holds no visible words. Tests check all four.
+
+Merchants can edit any of these words in Studio, per language. A field with a
+`contentKey` starts from that key's text.
+
+<Callout type="caution" title="Never state a store fact">
+A theme runs on many stores. Its words never claim a delivery reach ("69
+wilayas"), a delivery or exchange period, a guarantee, a percentage, opening
+hours, a phone call, a price, a phone number or an address. Those come from
+the store's data (its catalog, its contact details, the order form's quote)
+or from a field the merchant fills in. A test fails on the common cases.
+</Callout>
+
+## Change what a page starts with
+
+Each page's default layout is a JSON document in `src/theme/documents/`
+(`home.json`, `product.json`…, and `header.area.json` and
+`footer.area.json`). A document lists sections in order, each with a unique
+`id`, its `type` and its `props`:
+
+```json
+{
+  "id": "faq",
+  "type": "faq",
+  "props": { "title": { "ar": "أسئلة", "fr": "Questions", "en": "Common" } }
+}
+```
+
+A store renders its own saved document when it has one, and your default
+otherwise. Add `"hidden": true` to keep a section in the document without
+rendering it. A text value is either one string for every language or a map
+per language. The contract test validates every document in every language
+with `validatePageData`.
+
+## Let merchants change something new
+
+Add a field to the section's definition in `src/theme/sections/`, and read
+the new prop in its component:
+
+```ts
+fields: [
+  { key: "eyebrow", kind: "text", label: FIELD.eyebrow, contentKey: "home.hero.eyebrow" },
+  // …
+],
+```
+
+| In the design | Field |
+| --- | --- |
+| A heading with an accent word and a line under it | `headingFields(prefix)` from `src/theme/fields.ts` |
+| Any other word | `text` or `textarea`, with a `contentKey` and its key in every language |
+| Formatted text | `richtext` |
+| A photo | `image`: no default, the merchant picks it from the store's media |
+| A count | `number` with `min` and `max` |
+| A product, a collection, a category, a menu | `product`, `collection`, `category`, `menu` |
+| Repeated items | `list` with a `max` |
+| A choice | `select` with `options` and `optionLabels` |
+| A link | `url` |
+
+Its Studio label goes in `src/theme/labels.ts`, in every language (here, a
+new `eyebrow` entry in `FIELD`), and the `contentKey`'s text goes in
+`src/theme/content/`.
+[Fields](/sdk/theme/fields) lists every kind and its rules.
+
+## Add a section
+
+1. **The definition**, `src/theme/sections/<name>.ts`, with
+   `defineComponent`: its `type`, its `component`, its `label` and `group`
+   from `labels.ts`, `placement: "section"`, the pages it may go on
+   (`capabilities`: `ANYWHERE` or `WITH_LANDING` from `sections/shared.ts`),
+   and its fields, ending with `schemeField()` and `styleField()`. Data is read
+   in `load` through `reads.get(key, …)`, never in the component.
+2. **Register it** in `src/theme/sections/index.ts`.
+3. **The component**, `src/components/sections/<Name>.astro`, rendered
+   inside `Section.astro` with the section's `scheme` and `style`. With
+   nothing to show, it renders nothing for a shopper, and in Studio's
+   preview (`isPreview(blocks)`) an `EditorPlaceholder` that tells the
+   merchant what to fill in.
+4. **Its words and labels**, in `src/theme/content/` and `labels.ts`.
+5. **Its place** in a default document, if a page should start with it.
+6. **Its styles** in `src/styles/sections.css`, from tokens.
+
+Then run `npm run check` and `npm test`. The contract test validates the new
+definition, its presets and every document.
+
+## Changes that break merchants' work
+
+Merchants' saved pages name your theme key, section types, field keys and
+the instance ids of your default documents. So:
+
+- never rename `THEME_KEY`, a section `type`, a field `key` or a shipped
+  instance `id`;
+- adding a field, a section, a word or a preset is safe;
+- removing a section, a field or a word merchants may have edited needs a new
+  major version (`THEME_VERSION` in `src/theme/key.ts` and `version` in
+  `package.json`, which a test keeps equal).
+
+[Production and upgrades](/sdk/theme/production) covers releasing a new
+version.
